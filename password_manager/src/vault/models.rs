@@ -29,6 +29,15 @@ impl Vault {
         self.credentials.push(credential);
         Ok(())
     }
+    pub fn remove(&mut self, service: &str) -> Result<(), VaultError> {
+        let pos = self
+            .credentials
+            .iter()
+            .position(|c| c.service == service)
+            .ok_or(VaultError::NotFound)?;
+        self.credentials.remove(pos);
+        Ok(())
+    }
 }
 
 
@@ -65,5 +74,17 @@ mod tests {
         vault.add(credential("service1")).unwrap();
         let result_from_failure = vault.add(credential("service1"));
         assert_eq!(result_from_failure, Err(VaultError::DuplicateService));
+    }
+    #[test]
+    fn test_delete_entry() {
+        let mut vault = vault_multiple(&["service1", "service2", "service3"]);
+        vault.remove("service2");
+        assert_eq!(vault.get("service2"), None);
+    }
+    #[test]
+    fn test_delete_error(){
+        let mut vault = vault_multiple(&["service1", "service2", "service3"]);
+        let result_from_failure = vault.remove("service4");
+        assert_eq!(result_from_failure, Err(VaultError::NotFound));
     }
 }
