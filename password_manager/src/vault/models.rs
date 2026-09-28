@@ -43,7 +43,13 @@ mod tests {
             password: "pass".to_string(),
         }
     }
-
+    fn vault_multiple(services: &[&str]) -> Vault {
+        let mut vault = Vault::default();
+        for &service in services {
+            vault.add(credential(service)).unwrap();
+        }
+        vault
+    }
     #[test]
     fn test_credential() {
         let mut vault = Vault::default();
