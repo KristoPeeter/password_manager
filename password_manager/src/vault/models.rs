@@ -78,8 +78,12 @@ mod tests {
     #[test]
     fn test_delete_entry() {
         let mut vault = vault_multiple(&["service1", "service2", "service3"]);
-        vault.remove("service2");
+        let result= vault.remove("service2");
+        assert_eq!(result, Ok(()));
         assert_eq!(vault.get("service2"), None);
+        assert_eq!(vault.get("service1").is_some(), true);
+        assert_eq!(vault.get("service3").is_some(), true);
+
     }
     #[test]
     fn test_delete_error(){
