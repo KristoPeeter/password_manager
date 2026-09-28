@@ -1,0 +1,3 @@
+mod vault;
+
+fn main() {}
