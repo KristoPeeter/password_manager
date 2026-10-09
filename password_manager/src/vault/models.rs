@@ -91,4 +91,33 @@ mod tests {
         let result_from_failure = vault.remove("service4");
         assert_eq!(result_from_failure, Err(VaultError::NotFound));
     }
+    #[test]
+    fn test_services_in_insertion_order() {
+        let vault = vault_multiple(&["service2", "service1", "service3"]);
+        assert_eq!(vault.services(), vec!["service2", "service1", "service3"]);
+    }
+    #[test]
+    fn test_services_empty_vault() {
+        let vault = Vault::default();
+        assert!(vault.services().is_empty());
+    }
+    #[test]
+    fn test_credentials_returns_all_entries() {
+        let vault = vault_multiple(&["service1", "service2"]);
+        assert_eq!(
+            vault.credentials(),
+            &[credential("service1"), credential("service2")]
+        );
+    }
+    #[test]
+    fn test_is_empty() {
+        let mut vault = Vault::default();
+        assert!(vault.is_empty());
+
+        vault.add(credential("service1")).unwrap();
+        assert!(!vault.is_empty());
+
+        vault.remove("service1").unwrap();
+        assert!(vault.is_empty());
+    }
 }
