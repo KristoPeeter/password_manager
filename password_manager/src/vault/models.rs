@@ -38,8 +38,21 @@ impl Vault {
         self.credentials.remove(pos);
         Ok(())
     }
-}
+    pub fn services(&self) -> Vec<&str> {
+        self.credentials
+            .iter()
+            .map(|c| c.service.as_str())
+            .collect()
+    }
 
+    pub fn credentials(&self) -> &[Credential] {
+        &self.credentials
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.credentials.is_empty()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -78,15 +91,14 @@ mod tests {
     #[test]
     fn test_delete_entry() {
         let mut vault = vault_multiple(&["service1", "service2", "service3"]);
-        let result= vault.remove("service2");
+        let result = vault.remove("service2");
         assert_eq!(result, Ok(()));
         assert_eq!(vault.get("service2"), None);
-        assert_eq!(vault.get("service1").is_some(), true);
-        assert_eq!(vault.get("service3").is_some(), true);
-
+        assert_eq!(vault.get("service1").is_some());
+        assert_eq!(vault.get("service3").is_some());
     }
     #[test]
-    fn test_delete_error(){
+    fn test_delete_error() {
         let mut vault = vault_multiple(&["service1", "service2", "service3"]);
         let result_from_failure = vault.remove("service4");
         assert_eq!(result_from_failure, Err(VaultError::NotFound));
