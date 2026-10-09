@@ -1,3 +1,4 @@
+use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -16,6 +17,14 @@ pub struct Vault {
 pub enum VaultError {
     NotFound,
     DuplicateService,
+}
+impl fmt::Display for VaultError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VaultError::NotFound => write!(f, "Credential not found"),
+            VaultError::DuplicateService => write!(f, "Credential already exists"),
+        }
+    }
 }
 
 impl Vault {
@@ -94,8 +103,8 @@ mod tests {
         let result = vault.remove("service2");
         assert_eq!(result, Ok(()));
         assert_eq!(vault.get("service2"), None);
-        assert_eq!(vault.get("service1").is_some());
-        assert_eq!(vault.get("service3").is_some());
+        assert!(vault.get("service1").is_some());
+        assert!(vault.get("service3").is_some());
     }
     #[test]
     fn test_delete_error() {
