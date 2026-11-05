@@ -1,3 +1,6 @@
+mod ui;
 mod vault;
 
-fn main() {}
+fn main() {
+    ui::run();
+}
