@@ -7,7 +7,7 @@ use zeroize::Zeroizing;
 use super::crypto::{self, KdfParams, Key, NONCE_LEN, SALT_LEN};
 
 use super::models::Vault;
-use std::io::Write;
+use std::io::{Read, Write};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -83,7 +83,11 @@ fn read_file(path: &Path) -> Result<VaultFile, StorageError> {
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(StorageError::Unlock);
     }
-    serde_json::from_slice(&bytes).map_err(|_| StorageError::Unlock)
+    let file: VaultFile = serde_json::from_slice(&bytes).map_err(|_| StorageError::Unlock)?;
+    if file.header.version != VERSION || !file.header.kdf.is_within_bounds() {
+        return Err(StorageError::Unlock);
+    }
+    Ok(file)
 }
 
 fn decrypt_vault(file: &VaultFile, key: &Key) -> Result<Vault, StorageError> {
@@ -131,12 +135,7 @@ pub(crate) fn create_with_params(
     let session = SessionKey { key, salt, params };
     let bytes = encrypt_vault(&Vault::default(), &session)?;
 
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    options.open(path)?.write_all(&bytes)?;
-
+    write_atomically(path, &bytes, false)?;
     Ok(session)
 }
 pub fn unlock(path: &Path, password: &str) -> Result<SessionKey, StorageError> {
@@ -146,25 +145,45 @@ pub fn unlock(path: &Path, password: &str) -> Result<SessionKey, StorageError> {
     let key = crypto::derive_key(password.as_bytes(), &salt, &params)
         .map_err(|_| StorageError::Unlock)?;
     decrypt_vault(&file, &key)?;
+    #[cfg(unix)]
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     Ok(SessionKey { key, salt, params })
 }
 
 pub fn save(path: &Path, vault: &Vault, session: &SessionKey) -> Result<(), StorageError> {
-    fs::write(path, encrypt_vault(vault, session)?)?;
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    write_atomically(path, &encrypt_vault(vault, session)?, true)
 }
 pub fn load(path: &Path, session: &SessionKey) -> Result<Vault, StorageError> {
     decrypt_vault(&read_file(path)?, &session.key)
 }
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes)?;
-    #[cfg(unix)]
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(tmp, path)?;
-    Ok(())
+// writes a synced temp file and swaps it in
+fn write_atomically(path: &Path, bytes: &[u8], overwrite: bool) -> Result<(), StorageError> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let _ = fs::remove_file(&tmp);
+
+    let result = (|| -> io::Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+
+        if overwrite {
+            fs::rename(&tmp, path)
+        } else {
+            // hard_link fails if anything already exists at path, so create never overwrites a vault
+            fs::hard_link(&tmp, path)?;
+            fs::remove_file(&tmp)
+        }
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    Ok(result?)
 }
 
 #[cfg(test)]
