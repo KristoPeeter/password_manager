@@ -149,6 +149,9 @@ pub fn save(path: &Path, vault: &Vault, session: &SessionKey) -> Result<(), Stor
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
+pub fn load(path: &Path, session: &SessionKey) -> Result<Vault, StorageError> {
+    decrypt_vault(&read_file(path)?, &session.key)
+}
 
 
 #[cfg(test)]
