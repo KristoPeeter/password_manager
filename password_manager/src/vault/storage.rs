@@ -7,6 +7,10 @@ use zeroize::Zeroizing;
 use super::crypto::{self, KdfParams, Key, SALT_LEN, NONCE_LEN};
 
 use super::models::Vault;
+use std::io::Write;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const VERSION: u32 = 1;
 
@@ -108,17 +112,41 @@ fn encrypt_vault(vault: &Vault, session: &SessionKey) -> Result<Vec<u8>, Storage
     serde_json::to_vec_pretty(&file).map_err(|_| StorageError::Unlock)
 }
 
-pub fn load(path: &Path) -> Result<Vault, StorageError> {
-    match fs::read_to_string(path) {
-        Ok(contents) => Ok(serde_json::from_str(&contents)?),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vault::default()),
-        Err(e) => Err(e.into()),
-    }
+pub fn create(path: &Path, password: &str) -> Result<SessionKey, StorageError> {
+    create_with_params(path, password, KdfParams::DEFAULT)
+}
+pub(crate) fn create_with_params(
+    path: &Path,
+    password: &str,
+    params: KdfParams,
+) -> Result<SessionKey, StorageError> {
+    let salt = crypto::random_bytes::<SALT_LEN>();
+    let key = crypto::derive_key(password.as_bytes(), &salt, &params)
+        .map_err(|_| StorageError::Unlock)?;
+    let session = SessionKey { key, salt, params };
+    let bytes = encrypt_vault(&Vault::default(), &session)?;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)?.write_all(&bytes)?;
+
+    Ok(session)
+}
+pub fn unlock(path: &Path, password: &str) -> Result<SessionKey, StorageError> {
+    let file = read_file(path)?;
+    let salt = decode::<SALT_LEN>(&file.header.salt)?;
+    let params = file.header.kdf;
+    let key = crypto::derive_key(password.as_bytes(), &salt, &params).map_err(|_| StorageError::Unlock)?;
+    decrypt_vault(&file, &key)?;
+    Ok(SessionKey { key, salt, params })
 }
 
-pub fn save(path: &Path, vault: &Vault) -> Result<(), StorageError> {
-    let json = serde_json::to_string_pretty(vault)?;
-    fs::write(path, json)?;
+pub fn save(path: &Path, vault: &Vault, session: &SessionKey) -> Result<(), StorageError> {
+    fs::write(path, encrypt_vault(vault, session)?)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
