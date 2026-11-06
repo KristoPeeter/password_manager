@@ -39,6 +39,28 @@ impl From<io::Error> for StorageError {
     }
 }
 
+pub struct SessionKey {
+    key: Key,
+    salt: [u8; SALT_LEN],
+    params: KdfParams,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Header {
+    version: u32,
+    kdf: KdfParams,
+    salt: String,
+    nonce: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VaultFile {
+    header: Header,
+    ciphertext: String,
+}
+
 pub fn load(path: &Path) -> Result<Vault, StorageError> {
     match fs::read_to_string(path) {
         Ok(contents) => Ok(serde_json::from_str(&contents)?),
