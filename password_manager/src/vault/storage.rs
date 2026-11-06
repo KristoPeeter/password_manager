@@ -13,6 +13,7 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const VERSION: u32 = 1;
+const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB MAX for file sizes
 
 #[derive(Debug)]
 pub enum StorageError {
@@ -73,12 +74,16 @@ fn decode<const N: usize>(s: &str) -> Result<[u8; N], StorageError> {
 }
 
 fn read_file(path: &Path) -> Result<VaultFile, StorageError> {
-    let bytes = fs::read(path)?;
-    let file: VaultFile = serde_json::from_slice(&bytes).map_err(|_| StorageError::Unlock)?; // checked before any argon2 call so attack cant allocate memory
-    if file.header.version != VERSION || !file.header.kdf.is_within_bounds() {
+    let file = fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file").into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(StorageError::Unlock);
     }
-    Ok(file)
+    serde_json::from_slice(&bytes).map_err(|_| StorageError::Unlock)
 }
 
 fn decrypt_vault(file: &VaultFile, key: &Key) -> Result<Vault, StorageError> {
@@ -152,6 +157,14 @@ pub fn save(path: &Path, vault: &Vault, session: &SessionKey) -> Result<(), Stor
 }
 pub fn load(path: &Path, session: &SessionKey) -> Result<Vault, StorageError> {
     decrypt_vault(&read_file(path)?, &session.key)
+}
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(tmp, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -499,6 +512,125 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
         save(&path, &vault_with_github(), &session).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    fn file_names(dir: &tempfile::TempDir) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    // only changing the header (not the key or nonce) must still break decryption, proves the header is aad
+    #[test]
+    fn header_is_bound_as_aad() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, session) = new_vault(&dir);
+        let mut file: VaultFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(decrypt_vault(&file, &session.key).is_ok());
+
+        file.header.version = 2;
+
+        assert!(matches!(
+            decrypt_vault(&file, &session.key),
+            Err(StorageError::Unlock)
+        ));
+    }
+
+    // a save that fails halfway must leave the old vault exactly as it was
+    #[cfg(unix)]
+    #[test]
+    fn failed_save_keeps_old_vault() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, session) = new_vault(&dir);
+        let before = fs::read(&path).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = save(&path, &vault_with_github(), &session);
+
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(result, Err(StorageError::Io(_))));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(unlock(&path, PW).is_ok());
+    }
+
+    // saving never leaves a temp file lying around
+    #[test]
+    fn no_tmp_file_left_after_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, session) = new_vault(&dir);
+
+        save(&path, &vault_with_github(), &session).unwrap();
+
+        assert_eq!(file_names(&dir), vec!["vault.json"]);
+    }
+
+    // creating over an existing vault fails without leaving a temp file behind
+    #[test]
+    fn failed_create_leaves_no_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = new_vault(&dir);
+
+        let _ = create_with_params(&path, "another password", KdfParams::TEST);
+
+        assert_eq!(file_names(&dir), vec!["vault.json"]);
+    }
+
+    // if vault.json is swapped for a symlink, save replaces the link and never writes into the file it points to
+    #[cfg(unix)]
+    #[test]
+    fn save_replaces_symlink_instead_of_writing_through_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, session) = new_vault(&dir);
+        let victim = dir.path().join("victim.txt");
+        fs::write(&victim, "victim data").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        save(&path, &vault_with_github(), &session).unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "victim data");
+        let victim_mode = fs::metadata(&victim).unwrap().permissions().mode();
+        assert_eq!(victim_mode & 0o777, 0o644);
+        assert!(
+            !fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(load(&path, &session).unwrap(), vault_with_github());
+    }
+
+    // a giant file is rejected instead of being read whole into memory
+    #[test]
+    fn oversized_file_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = new_vault(&dir);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.resize(MAX_FILE_BYTES as usize + 1, b' ');
+        fs::write(&path, &bytes).unwrap();
+
+        assert_unlock_fails_and_file_untouched(&path);
+    }
+
+    // unlocking also fixes loose permissions, not only saving
+    #[cfg(unix)]
+    #[test]
+    fn unlock_restores_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = new_vault(&dir);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        unlock(&path, PW).unwrap();
 
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);

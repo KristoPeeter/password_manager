@@ -35,7 +35,7 @@ impl KdfParams {
 
     // because params are read from the untrusted external file we cap them before Argon2 allocates memory.
     pub fn is_within_bounds(&self) -> bool {
-        (8_192..=1_048_576).contains(&self.m_cost)
+        (8_192..=262_144).contains(&self.m_cost)
             && (1..=10).contains(&self.t_cost)
             && (1..=4).contains(&self.p_cost)
     }
@@ -172,8 +172,15 @@ mod tests {
         let p = KdfParams::DEFAULT;
         assert!(!KdfParams { m_cost: 8191, ..p }.is_within_bounds());
         assert!(
+            KdfParams {
+                m_cost: 262_144,
+                ..p
+            }
+            .is_within_bounds()
+        );
+        assert!(
             !KdfParams {
-                m_cost: 1_048_577,
+                m_cost: 262_145,
                 ..p
             }
             .is_within_bounds()
