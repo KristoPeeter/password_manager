@@ -1,17 +1,14 @@
 mod clipboard;
 
-use std::{
-    fmt,
-    io::{self, Write},
-    path::Path,
-    process::ExitCode,
-};
+use std::{fmt, io, path::Path, process::ExitCode};
 
 use inquire::{
     Confirm, InquireError, Password, PasswordDisplayMode, Select, Text, required,
     validator::Validation,
 };
 use zeroize::Zeroizing;
+
+use clipboard::{CLEAR_AFTER, ClipboardManager};
 
 use crate::vault::{
     models::{Credential, Vault, VaultError},
@@ -24,7 +21,7 @@ const VAULT_PATH: &str = "vault.json";
 enum MenuAction {
     Add,
     List,
-    Get,
+    Copy,
     Delete,
     Exit,
 }
@@ -34,7 +31,7 @@ impl fmt::Display for MenuAction {
         let label = match self {
             MenuAction::Add => "Add credential",
             MenuAction::List => "List credentials",
-            MenuAction::Get => "Show password",
+            MenuAction::Copy => "Copy password",
             MenuAction::Delete => "Delete credential",
             MenuAction::Exit => "Exit",
         };
@@ -45,7 +42,7 @@ impl fmt::Display for MenuAction {
 const MENU: [MenuAction; 5] = [
     MenuAction::Add,
     MenuAction::List,
-    MenuAction::Get,
+    MenuAction::Copy,
     MenuAction::Delete,
     MenuAction::Exit,
 ];
@@ -121,17 +118,26 @@ pub fn run() -> ExitCode {
         }
     };
 
+    // None when there is no usable clipboard, copy then reports it instead of printing the password
+    let clipboard = clipboard::system().ok();
+    let exit = |code: ExitCode| {
+        if let Some(clipboard) = &clipboard {
+            clipboard.clear_if_unchanged();
+        }
+        code
+    };
+
     loop {
         let mut vault = match storage::load(path, &session) {
             Ok(vault) => vault,
             Err(e) => {
                 eprintln!("Error: {}", e);
-                return ExitCode::FAILURE;
+                return exit(ExitCode::FAILURE);
             }
         };
 
         let Ok(action) = Select::new("What would you like to do?", MENU.to_vec()).prompt() else {
-            return ExitCode::SUCCESS;
+            return exit(ExitCode::SUCCESS);
         };
 
         let result = match action {
@@ -140,10 +146,9 @@ pub fn run() -> ExitCode {
                 list(&vault);
                 Ok(())
             }
-            MenuAction::Get => get(&vault),
-            // MenuAction::Update => update(&mut vault, path, &session),
+            MenuAction::Copy => copy(&vault, clipboard.as_ref()),
             MenuAction::Delete => delete(&mut vault, path, &session),
-            MenuAction::Exit => return ExitCode::SUCCESS,
+            MenuAction::Exit => return exit(ExitCode::SUCCESS),
         };
 
         match result {
@@ -238,20 +243,24 @@ fn list(vault: &Vault) {
         .for_each(|c| println!("{} — {}", c.service, c.username));
 }
 
-fn get(vault: &Vault) -> Result<(), ActionError> {
+// never falls back to printing, a password must not end up in the terminal or its scrollback
+fn copy(
+    vault: &Vault,
+    clipboard: Option<&ClipboardManager<arboard::Clipboard>>,
+) -> Result<(), ActionError> {
     let Some(service) = select_service(vault)? else {
         return Ok(());
     };
     let credential = vault.get(&service).ok_or(VaultError::NotFound)?;
 
-    println!("Username: {}", credential.username);
-    println!("Password: {}", credential.password);
-    println!("Press Enter to clear the screen...");
-    io::stdin().read_line(&mut String::new())?;
-
-    // this is here to clear the terminal
-    print!("\x1B[2J\x1B[3J\x1B[H");
-    io::stdout().flush()?;
+    match clipboard.map(|clipboard| clipboard.copy(&credential.password)) {
+        Some(Ok(())) => println!(
+            "Copied password for '{}' — clipboard clears in {}s.",
+            service,
+            CLEAR_AFTER.as_secs()
+        ),
+        _ => eprintln!("Clipboard unavailable"),
+    }
     Ok(())
 }
 
