@@ -8,7 +8,7 @@ use inquire::{Confirm, InquireError, Password, PasswordDisplayMode, Select, Text
 
 use crate::vault::{
     models::{Credential, Vault, VaultError},
-    storage::{self, StorageError},
+    storage::{self,SessionKey, StorageError},
 };
 
 const VAULT_PATH: &str = "vault.json";
@@ -94,11 +94,23 @@ impl From<io::Error> for ActionError {
 
 pub fn run() {
     let path = Path::new(VAULT_PATH);
-
-
+    let Ok(password) = Password::new("Master password:")
+    .with_display_mode(PasswordDisplayMode::Masked)
+    .without_confirmation()
+    .prompt() else {
+        return;
+    };
+    let opened = if path.exists() {storage::unlock(path, &password)} else {storage::create(path, &password)};
+    let session = match opened {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return;
+        }
+    };
     loop {
 
-        let mut vault = match storage::load(path) {
+        let mut vault = match storage::load(path, &session) {
             Ok(vault) => vault,
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -111,13 +123,14 @@ pub fn run() {
         };
 
         let result = match action {
-            MenuAction::Add => add(&mut vault, path),
+            MenuAction::Add => add(&mut vault, path, &session),
             MenuAction::List => {
                 list(&vault);
                 Ok(())
             }
             MenuAction::Get => get(&vault),
-            MenuAction::Delete => delete(&mut vault, path),
+           // MenuAction::Update => update(&mut vault, path, &session),
+            MenuAction::Delete => delete(&mut vault, path, &session),
             MenuAction::Exit => return,
         };
 
@@ -129,7 +142,7 @@ pub fn run() {
     }
 }
 
-fn add(vault: &mut Vault, path: &Path) -> Result<(), ActionError> {
+fn add(vault: &mut Vault, path: &Path, session: &SessionKey) -> Result<(), ActionError> {
     let service = Text::new("Service:")
         .with_validator(required!("Service is required"))
         .prompt()?;
@@ -148,7 +161,7 @@ fn add(vault: &mut Vault, path: &Path) -> Result<(), ActionError> {
         username,
         password,
     })?;
-    storage::save(path, vault)?;
+    storage::save(path, vault, session)?;
     println!("Saved.");
     Ok(())
 }
@@ -181,7 +194,7 @@ fn get(vault: &Vault) -> Result<(), ActionError> {
     Ok(())
 }
 
-fn delete(vault: &mut Vault, path: &Path) -> Result<(), ActionError> {
+fn delete(vault: &mut Vault, path: &Path, session: &SessionKey) -> Result<(), ActionError> {
     let Some(service) = select_service(vault)? else {
         return Ok(());
     };
@@ -193,7 +206,7 @@ fn delete(vault: &mut Vault, path: &Path) -> Result<(), ActionError> {
     }
 
     vault.remove(&service)?;
-    storage::save(path, vault)?;
+    storage::save(path, vault, session)?;
     println!("Deleted.");
     Ok(())
 }
