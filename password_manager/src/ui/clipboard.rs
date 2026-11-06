@@ -21,6 +21,9 @@ impl ClipboardBackend for arboard::Clipboard {
     fn get_text(&mut self) -> Result<String, ClipboardError> {
         arboard::Clipboard::get_text(self).map_err(|_| ClipboardError)
     }
+    fn clear(&mut self) -> Result<(), ClipboardError> {
+        arboard::Clipboard::clear(self).map_err(|_| ClipboardError)
+    }
 }
 
 struct State<B> {
@@ -127,7 +130,8 @@ mod tests {
         }
 
         fn clear(&mut self) -> Result<(), ClipboardError> {
-            arboard::Clipboard::clear(self).map_err(|_| ClipboardError)
+            *self.content.lock().unwrap() = None;
+            Ok(())
         }
     }
 
