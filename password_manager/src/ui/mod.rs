@@ -225,3 +225,59 @@ fn select_service(vault: &Vault) -> Result<Option<String>, ActionError> {
     let service = Select::new("Service:", vault.services()).prompt()?;
     Ok(Some(service.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOO_SHORT: Result<(), &str> = Err("Master password must be at least 8 characters");
+    const TOO_LONG: Result<(), &str> = Err("Master password is too long");
+
+    // 7 characters is too weak to protect the vault
+    #[test]
+    fn rejects_seven_characters() {
+        assert_eq!(validate_master_password("1234567"), TOO_SHORT);
+    }
+
+    // 8 characters is the minimum we accept
+    #[test]
+    fn accepts_eight_characters() {
+        assert_eq!(validate_master_password("12345678"), Ok(()));
+    }
+
+    // length is counted in characters, so umlauts don't count double
+    #[test]
+    fn counts_characters_not_bytes() {
+        assert_eq!(validate_master_password("ääääääää"), Ok(()));
+        assert_eq!(validate_master_password("äääääää"), TOO_SHORT);
+    }
+
+    // an absurdly long password is refused so argon2 never hashes megabytes of input
+    #[test]
+    fn rejects_over_1024_bytes() {
+        assert_eq!(validate_master_password(&"a".repeat(1025)), TOO_LONG);
+        assert_eq!(validate_master_password(&"a".repeat(1024)), Ok(()));
+    }
+
+    // spaces are part of the password, nothing is trimmed
+    #[test]
+    fn does_not_trim() {
+        assert_eq!(validate_master_password("       a"), Ok(()));
+    }
+
+    // the menu offers copy, never a way to show the password on screen
+    #[test]
+    fn menu_copies_instead_of_showing_passwords() {
+        let labels: Vec<String> = MENU.iter().map(|action| action.to_string()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Add credential",
+                "List credentials",
+                "Copy password",
+                "Delete credential",
+                "Exit"
+            ]
+        );
+    }
+}
