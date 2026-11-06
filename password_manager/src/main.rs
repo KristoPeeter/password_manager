@@ -1,6 +1,8 @@
+use std::process::ExitCode;
+
 mod ui;
 mod vault;
 
-fn main() {
-    ui::run();
+fn main() -> ExitCode {
+    ui::run()
 }

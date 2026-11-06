@@ -4,9 +4,14 @@ use std::{
     fmt,
     io::{self, Write},
     path::Path,
+    process::ExitCode,
 };
 
-use inquire::{Confirm, InquireError, Password, PasswordDisplayMode, Select, Text, required};
+use inquire::{
+    Confirm, InquireError, Password, PasswordDisplayMode, Select, Text, required,
+    validator::Validation,
+};
+use zeroize::Zeroizing;
 
 use crate::vault::{
     models::{Credential, Vault, VaultError},
@@ -94,38 +99,39 @@ impl From<io::Error> for ActionError {
     }
 }
 
-pub fn run() {
+const UNLOCK_ATTEMPTS: usize = 3;
+
+pub fn run() -> ExitCode {
     let path = Path::new(VAULT_PATH);
-    let Ok(password) = Password::new("Master password:")
-        .with_display_mode(PasswordDisplayMode::Masked)
-        .without_confirmation()
-        .prompt()
-    else {
-        return;
-    };
-    let opened = if path.exists() {
-        storage::unlock(path, &password)
-    } else {
-        storage::create(path, &password)
-    };
-    let session = match opened {
-        Ok(session) => session,
+
+    // try_exists, not exists: a permission error must not look like "no vault yet"
+    let session = match path.try_exists() {
+        Ok(false) => match create_vault(path) {
+            Some(session) => session,
+            None => return ExitCode::SUCCESS,
+        },
+        Ok(true) => match unlock_vault(path) {
+            Ok(Some(session)) => session,
+            Ok(None) => return ExitCode::SUCCESS,
+            Err(()) => return ExitCode::FAILURE,
+        },
         Err(e) => {
-            eprintln!("Error: {}", e);
-            return;
+            eprintln!("Could not access vault file: {e}");
+            return ExitCode::FAILURE;
         }
     };
+
     loop {
         let mut vault = match storage::load(path, &session) {
             Ok(vault) => vault,
             Err(e) => {
                 eprintln!("Error: {}", e);
-                return;
+                return ExitCode::FAILURE;
             }
         };
 
         let Ok(action) = Select::new("What would you like to do?", MENU.to_vec()).prompt() else {
-            return;
+            return ExitCode::SUCCESS;
         };
 
         let result = match action {
@@ -137,7 +143,7 @@ pub fn run() {
             MenuAction::Get => get(&vault),
             // MenuAction::Update => update(&mut vault, path, &session),
             MenuAction::Delete => delete(&mut vault, path, &session),
-            MenuAction::Exit => return,
+            MenuAction::Exit => return ExitCode::SUCCESS,
         };
 
         match result {
@@ -146,6 +152,55 @@ pub fn run() {
             Err(e) => eprintln!("Error: {}", e),
         }
     }
+}
+
+fn create_vault(path: &Path) -> Option<SessionKey> {
+    println!("No vault found — create one.");
+    let password = Password::new("New master password:")
+        .with_display_mode(PasswordDisplayMode::Masked)
+        .with_custom_confirmation_message("Confirm master password:")
+        .with_custom_confirmation_error_message("Passwords do not match")
+        .with_validator(|input: &str| {
+            Ok(match validate_master_password(input) {
+                Ok(()) => Validation::Valid,
+                Err(message) => Validation::Invalid(message.into()),
+            })
+        })
+        .prompt()
+        .ok()
+        .map(Zeroizing::new)?;
+
+    match storage::create(path, &password) {
+        Ok(session) => Some(session),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            None
+        }
+    }
+}
+
+// Ok(None) means the user cancelled, Err(()) means give up and exit with failure
+fn unlock_vault(path: &Path) -> Result<Option<SessionKey>, ()> {
+    for _ in 0..UNLOCK_ATTEMPTS {
+        let Ok(password) = Password::new("Master password:")
+            .with_display_mode(PasswordDisplayMode::Masked)
+            .without_confirmation()
+            .prompt()
+            .map(Zeroizing::new)
+        else {
+            return Ok(None);
+        };
+
+        match storage::unlock(path, &password) {
+            Ok(session) => return Ok(Some(session)),
+            Err(StorageError::Unlock) => eprintln!("Couldn't unlock vault"),
+            Err(e) => {
+                eprintln!("{}", e);
+                return Err(());
+            }
+        }
+    }
+    Err(())
 }
 
 fn add(vault: &mut Vault, path: &Path, session: &SessionKey) -> Result<(), ActionError> {
@@ -224,6 +279,16 @@ fn select_service(vault: &Vault) -> Result<Option<String>, ActionError> {
     }
     let service = Select::new("Service:", vault.services()).prompt()?;
     Ok(Some(service.to_string()))
+}
+// min counts characters (what the user sees), max counts bytes (what argon2 has to hash)
+fn validate_master_password(password: &str) -> Result<(), &'static str> {
+    if password.chars().count() < 8 {
+        Err("Master password must be at least 8 characters")
+    } else if password.len() > 1024 {
+        Err("Master password is too long")
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
