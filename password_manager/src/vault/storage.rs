@@ -1,16 +1,28 @@
 use std ::{fs, fmt, io, path::Path};
+
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
+
+use super::crypto::{self, KdfParams, Key, SALT_LEN, NONCE_LEN};
+
 use super::models::Vault;
+
+const VERSION: u32 = 1;
 
 #[derive(Debug)]
 pub enum StorageError {
     Io(io::Error),
-    Parse(serde_json::Error),
+    NotFound,
+    Unlock,
 }
+
 impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StorageError::Io(e) => write!(f, "I/O error: {}", e),
-            StorageError::Parse(e) => write!(f, "Parse error: {}", e),
+            StorageError::Io(e) => write!(f, "Could not access vault file: {}", e),
+            StorageError::NotFound => write!(f, "No vault found"),
+            StorageError::Unlock => write!(f, "Couldn't unlock vault"),
         }
     }
 }
@@ -19,13 +31,11 @@ impl std::error::Error for StorageError {}
 
 impl From<io::Error> for StorageError {
     fn from(e: io::Error) -> Self {
-        StorageError::Io(e)
-    }
-}
-
-impl From<serde_json::Error> for StorageError {
-    fn from(e: serde_json::Error) -> Self {
-        StorageError::Parse(e)
+        if e.kind() == io::ErrorKind::NotFound {
+            StorageError::NotFound
+        } else {
+            StorageError::Io(e)
+        }
     }
 }
 
