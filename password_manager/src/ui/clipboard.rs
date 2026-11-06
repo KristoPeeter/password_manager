@@ -8,7 +8,7 @@ mod tests {
 
     const CLEAR_AFTER_TEST: Duration = Duration::from_millis(100);
 
-    // stands in for the real system clipboard so tests never touch yours
+    // fake clipboard so tests never touch the real one
     #[derive(Clone, Default)]
     struct Fake {
         content: Arc<Mutex<Option<String>>>,
