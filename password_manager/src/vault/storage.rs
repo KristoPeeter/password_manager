@@ -159,7 +159,6 @@ mod tests {
     use super::*;
     use crate::vault::crypto::KdfParams;
     use crate::vault::models::{Credential, Vault};
-    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     use std::fs;
     use std::path::{Path, PathBuf};
 
