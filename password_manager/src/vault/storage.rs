@@ -61,6 +61,53 @@ struct VaultFile {
     ciphertext: String,
 }
 
+fn decode<const N: usize>(s: &str) -> Result<[u8; N], StorageError> {
+    B64.decode(s)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(StorageError::Unlock)
+}
+
+fn read_file(path: &Path) -> Result<VaultFile, StorageError> {
+    let bytes = fs::read(path)?;
+    let file: VaultFile = serde_json::from_slice(&bytes).map_err(|_| StorageError::Unlock)?; // checked before any argon2 call so attack cant allocate memory
+    if file.header.version != VERSION || !file.header.kdf.is_within_bounds() {
+        return Err(StorageError::Unlock);
+    }
+    Ok(file)
+}
+
+fn decrypt_vault(file: &VaultFile, key: &Key) -> Result<Vault, StorageError> {
+    let nonce = decode::<NONCE_LEN>(&file.header.nonce)?;
+    let ciphertext = B64
+        .decode(&file.ciphertext)
+        .map_err(|_| StorageError::Unlock)?;
+    let aad = serde_json::to_vec(&file.header).map_err(|_| StorageError::Unlock)?;
+    let plaintext =
+        crypto::decrypt(key, &nonce, &aad, &ciphertext).map_err(|_| StorageError::Unlock)?;
+    serde_json::from_slice(&plaintext).map_err(|_| StorageError::Unlock)
+}
+
+fn encrypt_vault(vault: &Vault, session: &SessionKey) -> Result<Vec<u8>, StorageError> {
+    // a fresh nonce on every save, reusing one with the same key breaks aes-gcm
+    let nonce = crypto::random_bytes::<NONCE_LEN>();
+    let header = Header {
+        version: VERSION,
+        kdf: session.params,
+        salt: B64.encode(session.salt),
+        nonce: B64.encode(nonce),
+    };
+    let aad = serde_json::to_vec(&header).map_err(|_| StorageError::Unlock)?;
+    let plaintext = Zeroizing::new(serde_json::to_vec(vault).map_err(|_| StorageError::Unlock)?);
+    let ciphertext = crypto::encrypt(&session.key, &nonce, &aad, &plaintext)
+        .map_err(|_| StorageError::Unlock)?;
+    let file = VaultFile {
+        header,
+        ciphertext: B64.encode(ciphertext),
+    };
+    serde_json::to_vec_pretty(&file).map_err(|_| StorageError::Unlock)
+}
+
 pub fn load(path: &Path) -> Result<Vault, StorageError> {
     match fs::read_to_string(path) {
         Ok(contents) => Ok(serde_json::from_str(&contents)?),
