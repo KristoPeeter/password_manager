@@ -1,10 +1,10 @@
-use std ::{fs, fmt, io, path::Path};
+use std::{fmt, fs, io, path::Path};
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use super::crypto::{self, KdfParams, Key, SALT_LEN, NONCE_LEN};
+use super::crypto::{self, KdfParams, Key, NONCE_LEN, SALT_LEN};
 
 use super::models::Vault;
 use std::io::Write;
@@ -138,7 +138,8 @@ pub fn unlock(path: &Path, password: &str) -> Result<SessionKey, StorageError> {
     let file = read_file(path)?;
     let salt = decode::<SALT_LEN>(&file.header.salt)?;
     let params = file.header.kdf;
-    let key = crypto::derive_key(password.as_bytes(), &salt, &params).map_err(|_| StorageError::Unlock)?;
+    let key = crypto::derive_key(password.as_bytes(), &salt, &params)
+        .map_err(|_| StorageError::Unlock)?;
     decrypt_vault(&file, &key)?;
     Ok(SessionKey { key, salt, params })
 }
@@ -152,7 +153,6 @@ pub fn save(path: &Path, vault: &Vault, session: &SessionKey) -> Result<(), Stor
 pub fn load(path: &Path, session: &SessionKey) -> Result<Vault, StorageError> {
     decrypt_vault(&read_file(path)?, &session.key)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -325,7 +325,9 @@ mod tests {
         let (path, _) = new_vault(&dir);
 
         tamper(&path, |json| {
-            let salt = B64.decode(json["header"]["salt"].as_str().unwrap()).unwrap();
+            let salt = B64
+                .decode(json["header"]["salt"].as_str().unwrap())
+                .unwrap();
             let other: Vec<u8> = salt.iter().map(|b| b ^ 0xFF).collect();
             json["header"]["salt"] = B64.encode(other).into();
         });
@@ -340,7 +342,9 @@ mod tests {
         let (path, _) = new_vault(&dir);
 
         tamper(&path, |json| {
-            let nonce = B64.decode(json["header"]["nonce"].as_str().unwrap()).unwrap();
+            let nonce = B64
+                .decode(json["header"]["nonce"].as_str().unwrap())
+                .unwrap();
             let other: Vec<u8> = nonce.iter().map(|b| b ^ 0xFF).collect();
             json["header"]["nonce"] = B64.encode(other).into();
         });
@@ -416,7 +420,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (path, _) = new_vault(&dir);
 
-        tamper(&path, |json| json["header"]["salt"] = B64.encode([1u8; 15]).into());
+        tamper(&path, |json| {
+            json["header"]["salt"] = B64.encode([1u8; 15]).into()
+        });
 
         assert_unlock_fails_and_file_untouched(&path);
     }
@@ -427,7 +433,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (path, _) = new_vault(&dir);
 
-        tamper(&path, |json| json["ciphertext"] = B64.encode([1u8; 4]).into());
+        tamper(&path, |json| {
+            json["ciphertext"] = B64.encode([1u8; 4]).into()
+        });
 
         assert_unlock_fails_and_file_untouched(&path);
     }

@@ -8,7 +8,7 @@ use inquire::{Confirm, InquireError, Password, PasswordDisplayMode, Select, Text
 
 use crate::vault::{
     models::{Credential, Vault, VaultError},
-    storage::{self,SessionKey, StorageError},
+    storage::{self, SessionKey, StorageError},
 };
 
 const VAULT_PATH: &str = "vault.json";
@@ -95,12 +95,17 @@ impl From<io::Error> for ActionError {
 pub fn run() {
     let path = Path::new(VAULT_PATH);
     let Ok(password) = Password::new("Master password:")
-    .with_display_mode(PasswordDisplayMode::Masked)
-    .without_confirmation()
-    .prompt() else {
+        .with_display_mode(PasswordDisplayMode::Masked)
+        .without_confirmation()
+        .prompt()
+    else {
         return;
     };
-    let opened = if path.exists() {storage::unlock(path, &password)} else {storage::create(path, &password)};
+    let opened = if path.exists() {
+        storage::unlock(path, &password)
+    } else {
+        storage::create(path, &password)
+    };
     let session = match opened {
         Ok(session) => session,
         Err(e) => {
@@ -109,7 +114,6 @@ pub fn run() {
         }
     };
     loop {
-
         let mut vault = match storage::load(path, &session) {
             Ok(vault) => vault,
             Err(e) => {
@@ -129,7 +133,7 @@ pub fn run() {
                 Ok(())
             }
             MenuAction::Get => get(&vault),
-           // MenuAction::Update => update(&mut vault, path, &session),
+            // MenuAction::Update => update(&mut vault, path, &session),
             MenuAction::Delete => delete(&mut vault, path, &session),
             MenuAction::Exit => return,
         };

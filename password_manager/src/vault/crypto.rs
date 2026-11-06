@@ -69,7 +69,13 @@ pub fn encrypt(
 ) -> Result<Vec<u8>, CryptoError> {
     let cipher = Aes256Gcm::new_from_slice(key.as_slice()).map_err(|_| CryptoError)?;
     cipher
-        .encrypt(&Nonce::from(*nonce), Payload { msg: plaintext, aad })
+        .encrypt(
+            &Nonce::from(*nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| CryptoError)
 }
 
@@ -81,7 +87,13 @@ pub fn decrypt(
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let cipher = Aes256Gcm::new_from_slice(key.as_slice()).map_err(|_| CryptoError)?;
     cipher
-        .decrypt(&Nonce::from(*nonce), Payload { msg: ciphertext, aad })
+        .decrypt(
+            &Nonce::from(*nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map(Zeroizing::new)
         .map_err(|_| CryptoError)
 }
@@ -159,7 +171,13 @@ mod tests {
     fn out_of_bounds_params_are_rejected() {
         let p = KdfParams::DEFAULT;
         assert!(!KdfParams { m_cost: 8191, ..p }.is_within_bounds());
-        assert!(!KdfParams { m_cost: 1_048_577, ..p }.is_within_bounds());
+        assert!(
+            !KdfParams {
+                m_cost: 1_048_577,
+                ..p
+            }
+            .is_within_bounds()
+        );
         assert!(!KdfParams { t_cost: 0, ..p }.is_within_bounds());
         assert!(!KdfParams { t_cost: 11, ..p }.is_within_bounds());
         assert!(!KdfParams { p_cost: 0, ..p }.is_within_bounds());
