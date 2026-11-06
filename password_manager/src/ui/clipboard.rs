@@ -84,7 +84,7 @@ impl<B: ClipboardBackend> ClipboardManager<B> {
         Ok(())
     }
     pub fn clear_if_unchanged(&self) {
-        clear_if_holds_pending(&mut lock(&self.state));
+        clear_if_pending(&mut lock(&self.state));
     }
 }
 
@@ -127,8 +127,7 @@ mod tests {
         }
 
         fn clear(&mut self) -> Result<(), ClipboardError> {
-            *self.content.lock().unwrap() = None;
-            Ok(())
+            arboard::Clipboard::clear(self).map_err(|_| ClipboardError)
         }
     }
 
