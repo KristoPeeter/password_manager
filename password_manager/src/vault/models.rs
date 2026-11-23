@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct Credential {
     pub username: String,

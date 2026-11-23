@@ -10,7 +10,7 @@ use super::models::Vault;
 use std::io::{Read, Write};
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 const VERSION: u32 = 1;
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB MAX for file sizes
@@ -20,6 +20,7 @@ pub enum StorageError {
     Io(io::Error),
     NotFound,
     Unlock,
+    TooLarge,
 }
 
 impl fmt::Display for StorageError {
@@ -28,6 +29,7 @@ impl fmt::Display for StorageError {
             StorageError::Io(e) => write!(f, "Could not access vault file: {}", e),
             StorageError::NotFound => write!(f, "No vault found"),
             StorageError::Unlock => write!(f, "Couldn't unlock vault"),
+            StorageError::TooLarge => write!(f, "Vault is too large to save"),
         }
     }
 }
@@ -74,6 +76,10 @@ fn decode<const N: usize>(s: &str) -> Result<[u8; N], StorageError> {
 }
 
 fn read_file(path: &Path) -> Result<VaultFile, StorageError> {
+    // checked before open: opening a fifo blocks until something writes to it
+    if !fs::metadata(path)?.is_file() {
+        return Err(io::Error::other("not a regular file").into());
+    }
     let file = fs::File::open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("not a regular file").into());
@@ -151,39 +157,38 @@ pub fn unlock(path: &Path, password: &str) -> Result<SessionKey, StorageError> {
 }
 
 pub fn save(path: &Path, vault: &Vault, session: &SessionKey) -> Result<(), StorageError> {
-    write_atomically(path, &encrypt_vault(vault, session)?, true)
+    let bytes = encrypt_vault(vault, session)?;
+    // read_file refuses anything over the limit, so writing it would lock the user out of their vault
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(StorageError::TooLarge);
+    }
+    write_atomically(path, &bytes, true)
 }
 pub fn load(path: &Path, session: &SessionKey) -> Result<Vault, StorageError> {
     decrypt_vault(&read_file(path)?, &session.key)
 }
 // writes a synced temp file and swaps it in
 fn write_atomically(path: &Path, bytes: &[u8], overwrite: bool) -> Result<(), StorageError> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let _ = fs::remove_file(&tmp);
+    // same folder as the target, so the final rename never crosses filesystems
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
 
-    let result = (|| -> io::Result<()> {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    tmp.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
 
-        if overwrite {
-            fs::rename(&tmp, path)
-        } else {
-            // hard_link fails if anything already exists at path, so create never overwrites a vault
-            fs::hard_link(&tmp, path)?;
-            fs::remove_file(&tmp)
-        }
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+    if overwrite {
+        tmp.persist(path).map_err(|e| e.error)?;
+    } else {
+        // fails if anything already exists at path
+        tmp.persist_noclobber(path).map_err(|e| e.error)?;
     }
-    Ok(result?)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -660,7 +665,11 @@ mod tests {
         let before = fs::read(&path).unwrap();
 
         // base64 grows data by 4/3, so this ends up well over MAX_FILE_BYTES on disk
-        let result = save(&path, &vault_with_password_of_len(8 * 1024 * 1024), &session);
+        let result = save(
+            &path,
+            &vault_with_password_of_len(8 * 1024 * 1024),
+            &session,
+        );
 
         assert!(matches!(result, Err(StorageError::TooLarge)));
         assert_eq!(fs::read(&path).unwrap(), before);
