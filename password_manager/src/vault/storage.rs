@@ -640,6 +640,101 @@ mod tests {
         assert_unlock_fails_and_file_untouched(&path);
     }
 
+    fn vault_with_password_of_len(len: usize) -> Vault {
+        let mut vault = Vault::default();
+        vault
+            .add(Credential {
+                service: "big".to_string(),
+                username: "alice".to_string(),
+                password: "a".repeat(len),
+            })
+            .unwrap();
+        vault
+    }
+
+    // a vault too big to read back must not be written, or the next unlock would lock the user out
+    #[test]
+    fn save_refuses_vault_over_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, session) = new_vault(&dir);
+        let before = fs::read(&path).unwrap();
+
+        // base64 grows data by 4/3, so this ends up well over MAX_FILE_BYTES on disk
+        let result = save(&path, &vault_with_password_of_len(8 * 1024 * 1024), &session);
+
+        assert!(matches!(result, Err(StorageError::TooLarge)));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(unlock(&path, PW).is_ok());
+    }
+
+    // the save limit is not stricter than the read limit: what fits is saved and loads back
+    #[test]
+    fn anything_saved_can_be_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, session) = new_vault(&dir);
+        let vault = vault_with_password_of_len(7 * 1024 * 1024);
+
+        save(&path, &vault, &session).unwrap();
+
+        assert!(fs::metadata(&path).unwrap().len() <= MAX_FILE_BYTES);
+        assert_eq!(load(&path, &session).unwrap(), vault);
+    }
+
+    // saves racing on the same vault must not trip over each other's temp file
+    #[test]
+    fn concurrent_saves_all_succeed_and_vault_stays_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, session) = new_vault(&dir);
+        let vault = vault_with_github();
+
+        let errors: usize = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        (0..50)
+                            .filter(|_| save(&path, &vault, &session).is_err())
+                            .count()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).sum()
+        });
+
+        assert_eq!(errors, 0);
+        assert_eq!(load(&path, &session).unwrap(), vault_with_github());
+        assert_eq!(file_names(&dir), vec!["vault.json"]);
+    }
+
+    // opening a fifo blocks until a writer shows up, so unlock must check the file type first
+    #[cfg(unix)]
+    #[test]
+    fn named_pipe_at_vault_path_fails_fast() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let (tx, rx) = mpsc::channel();
+        let fifo = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(unlock(&fifo, PW).is_err());
+        });
+
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(failed) => assert!(failed, "unlock of a fifo must fail"),
+            Err(_) => {
+                // release the blocked reader so the thread doesn't hang around
+                let _ = fs::OpenOptions::new().write(true).open(&path);
+                panic!("unlock blocked on a named pipe");
+            }
+        }
+    }
+
     // unlocking also fixes loose permissions, not only saving
     #[cfg(unix)]
     #[test]

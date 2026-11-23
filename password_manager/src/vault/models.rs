@@ -130,6 +130,27 @@ mod tests {
             &[credential("service1"), credential("service2")]
         );
     }
+    // wiping a credential leaves nothing of the secret behind in its strings
+    #[test]
+    fn credential_zeroize_empties_every_field() {
+        use zeroize::Zeroize;
+        let mut c = credential("service1");
+
+        c.zeroize();
+
+        assert!(c.service.is_empty());
+        assert!(c.username.is_empty());
+        assert!(c.password.is_empty());
+    }
+
+    // compile-time check: dropping these types wipes them, nobody has to remember to call zeroize
+    #[test]
+    fn secret_types_are_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Credential>();
+        assert_zeroize_on_drop::<crate::vault::crypto::Key>();
+    }
+
     #[test]
     fn test_is_empty() {
         let mut vault = Vault::default();
