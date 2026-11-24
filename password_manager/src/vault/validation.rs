@@ -1,3 +1,107 @@
+use std::fmt;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Field {
+    Service,
+    Username,
+    Password,
+}
+
+impl Field {
+    // the name that goes into the log, so it is fixed and never contains a value. Logging to be added asap
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Field::Service => "service",
+            Field::Username => "username",
+            Field::Password => "password",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ValidationError {
+    pub field: Field,
+    pub message: &'static str,
+}
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+const MAX_SERVICE_CHARS: usize = 64;
+// 254 is the longest valid email address (RFC 5321), the most common kind of username
+const MAX_USERNAME_CHARS: usize = 254;
+const MAX_PASSWORD_BYTES: usize = 1024;
+
+fn invalid<T>(field: Field, message: &'static str) -> Result<T, ValidationError> {
+    Err(ValidationError { field, message })
+}
+
+// control characters include line breaks and the escape byte that starts terminal colour and cursor codes. refusing them means every stored value is safe to print or log.
+// checked before trimming, because trim would quietly remove a trailing newline
+fn reject_control_characters(input: &str, field: Field) -> Result<(), ValidationError> {
+    if input.chars().any(char::is_control) {
+        invalid(
+            field,
+            "Control characters (line breaks, tabs, escape codes) are not allowed",
+        )
+    } else {
+        Ok(())
+    }
+}
+
+// returns the trimmed name, so "github" and "github " can't become two entries
+pub fn service(input: &str) -> Result<String, ValidationError> {
+    reject_control_characters(input, Field::Service)?;
+    let value = input.trim();
+    match value.chars().count() {
+        0 => invalid(Field::Service, "Service name is required"),
+        n if n > MAX_SERVICE_CHARS => {
+            invalid(Field::Service, "Service name can be at most 64 characters")
+        }
+        _ => Ok(value.to_owned()),
+    }
+}
+
+// empty is allowed: some sites only use a password or an email elsewhere
+pub fn credential_username(input: &str) -> Result<String, ValidationError> {
+    reject_control_characters(input, Field::Username)?;
+    let value = input.trim();
+    if value.chars().count() > MAX_USERNAME_CHARS {
+        invalid(Field::Username, "Username can be at most 254 characters")
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+// never trimmed: spaces can be part of a password. the cap is in bytes because it
+// bounds memory and file size, not what the user sees
+pub fn credential_password(input: &str) -> Result<(), ValidationError> {
+    if input.is_empty() {
+        return invalid(Field::Password, "Password is required");
+    }
+    if input.len() > MAX_PASSWORD_BYTES {
+        return invalid(Field::Password, "Password is too long");
+    }
+    reject_control_characters(input, Field::Password)
+}
+
+// min counts characters (what the user sees), max counts bytes (what argon2 has to hash)
+pub fn master_password(password: &str) -> Result<(), &'static str> {
+    if password.chars().count() < 8 {
+        Err("Master password must be at least 8 characters")
+    } else if password.len() > 1024 {
+        Err("Master password is too long")
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

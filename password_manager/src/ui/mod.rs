@@ -13,6 +13,7 @@ use clipboard::{CLEAR_AFTER, ClipboardManager};
 use crate::vault::{
     models::{Credential, Vault, VaultError},
     storage::{self, SessionKey, StorageError},
+    validation,
 };
 
 const VAULT_PATH: &str = "vault.json";
@@ -166,7 +167,7 @@ fn create_vault(path: &Path) -> Option<SessionKey> {
         .with_custom_confirmation_message("Confirm master password:")
         .with_custom_confirmation_error_message("Passwords do not match")
         .with_validator(|input: &str| {
-            Ok(match validate_master_password(input) {
+            Ok(match validation::master_password(input) {
                 Ok(()) => Validation::Valid,
                 Err(message) => Validation::Invalid(message.into()),
             })
@@ -289,17 +290,6 @@ fn select_service(vault: &Vault) -> Result<Option<String>, ActionError> {
     let service = Select::new("Service:", vault.services()).prompt()?;
     Ok(Some(service.to_string()))
 }
-// min counts characters (what the user sees), max counts bytes (what argon2 has to hash)
-fn validate_master_password(password: &str) -> Result<(), &'static str> {
-    if password.chars().count() < 8 {
-        Err("Master password must be at least 8 characters")
-    } else if password.len() > 1024 {
-        Err("Master password is too long")
-    } else {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+use super::validation::{self, ValidationError};
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
@@ -18,13 +20,21 @@ pub struct Vault {
 pub enum VaultError {
     NotFound,
     DuplicateService,
+    Invalid(ValidationError),
 }
 impl fmt::Display for VaultError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             VaultError::NotFound => write!(f, "Credential not found"),
             VaultError::DuplicateService => write!(f, "Credential already exists"),
+            VaultError::Invalid(e) => write!(f, "{e}"),
         }
+    }
+}
+
+impl From<ValidationError> for VaultError {
+    fn from(e: ValidationError) -> Self {
+        VaultError::Invalid(e)
     }
 }
 
@@ -32,10 +42,16 @@ impl Vault {
     pub fn get(&self, service: &str) -> Option<&Credential> {
         self.credentials.iter().find(|c| c.service == service)
     }
-    pub fn add(&mut self, credential: Credential) -> Result<(), VaultError> {
-        if self.get(&credential.service).is_some() {
+    // validates here as well as in the prompts, so no caller can store an unchecked field
+    pub fn add(&mut self, mut credential: Credential) -> Result<(), VaultError> {
+        let service = validation::service(&credential.service)?;
+        let username = validation::credential_username(&credential.username)?;
+        validation::credential_password(&credential.password)?;
+        if self.get(&service).is_some() {
             return Err(VaultError::DuplicateService);
         }
+        credential.service = service;
+        credential.username = username;
         self.credentials.push(credential);
         Ok(())
     }
@@ -48,6 +64,39 @@ impl Vault {
         self.credentials.remove(pos);
         Ok(())
     }
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn get_mut(&mut self, service: &str) -> Result<&mut Credential, VaultError> {
+        self.credentials
+            .iter_mut()
+            .find(|c| c.service == service)
+            .ok_or(VaultError::NotFound)
+    }
+
+    // not called by the ui until the update menu entry is added (task 11)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn update_username(&mut self, service: &str, new: &str) -> Result<(), VaultError> {
+        let credential = self.get_mut(service)?;
+        let username = validation::credential_username(new)?;
+        credential.username.zeroize();
+        credential.username = username;
+        Ok(())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    // takes Zeroizing so the caller's copy of the new password is wiped too
+    pub fn update_password(
+        &mut self,
+        service: &str,
+        mut new: Zeroizing<String>,
+    ) -> Result<(), VaultError> {
+        let credential = self.get_mut(service)?;
+        validation::credential_password(&new)?;
+        // wipe the old password before it is dropped, then move the new one in without copying it
+        credential.password.zeroize();
+        credential.password = std::mem::take(&mut *new);
+        Ok(())
+    }
+
     pub fn services(&self) -> Vec<&str> {
         self.credentials
             .iter()
