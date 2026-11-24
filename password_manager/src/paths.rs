@@ -265,7 +265,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ensure_creates_owner_only_folders() {
-        use std::os::unix::fs::PermissionsExt;  
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let data = DataDir::at(dir.path().join("securevault"));
 
