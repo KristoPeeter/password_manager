@@ -645,15 +645,18 @@ mod tests {
         assert_unlock_fails_and_file_untouched(&path);
     }
 
-    fn vault_with_password_of_len(len: usize) -> Vault {
+    // fields are capped (a password is at most 1024 bytes), so a big vault needs many entries.
+    fn vault_with_entries(count: usize) -> Vault {
         let mut vault = Vault::default();
-        vault
-            .add(Credential {
-                service: "big".to_string(),
-                username: "alice".to_string(),
-                password: "a".repeat(len),
-            })
-            .unwrap();
+        for i in 0..count {
+            vault
+                .add(Credential {
+                    service: format!("service{i}"),
+                    username: "alice".to_string(),
+                    password: "a".repeat(1024),
+                })
+                .unwrap();
+        }
         vault
     }
 
@@ -664,10 +667,9 @@ mod tests {
         let (path, session) = new_vault(&dir);
         let before = fs::read(&path).unwrap();
 
-        // base64 grows data by 4/3, so this ends up well over MAX_FILE_BYTES on disk
         let result = save(
             &path,
-            &vault_with_password_of_len(8 * 1024 * 1024),
+            &vault_with_entries(8000), // about 11.5 MB on disk
             &session,
         );
 
@@ -681,7 +683,7 @@ mod tests {
     fn anything_saved_can_be_loaded() {
         let dir = tempfile::tempdir().unwrap();
         let (path, session) = new_vault(&dir);
-        let vault = vault_with_password_of_len(7 * 1024 * 1024);
+        let vault = vault_with_entries(6500); // about 9.3 MB on disk
 
         save(&path, &vault, &session).unwrap();
 

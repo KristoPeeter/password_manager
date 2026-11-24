@@ -67,6 +67,7 @@ impl Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vault::validation::Field;
 
     fn credential(service: &str) -> Credential {
         Credential {
@@ -162,5 +163,127 @@ mod tests {
 
         vault.remove("service1").unwrap();
         assert!(vault.is_empty());
+    }
+
+    // --- validation and update (task 3) ---
+
+    fn credential_with(service: &str, username: &str, password: &str) -> Credential {
+        Credential {
+            service: service.to_string(),
+            username: username.to_string(),
+            password: password.to_string(),
+        }
+    }
+
+    fn invalid_field(result: Result<(), VaultError>) -> Option<Field> {
+        match result {
+            Err(VaultError::Invalid(e)) => Some(e.field),
+            _ => None,
+        }
+    }
+
+    // add is the last gate before the vault, so it checks every field itself
+    #[test]
+    fn add_rejects_invalid_fields() {
+        let mut vault = vault_multiple(&["service1"]);
+        let cases = [
+            (
+                credential_with(&"a".repeat(65), "user", "pass"),
+                Field::Service,
+            ),
+            (
+                credential_with("ok", &"a".repeat(255), "pass"),
+                Field::Username,
+            ),
+            (credential_with("ok", "user", ""), Field::Password),
+            (credential_with("ok", "user", "a\nb"), Field::Password),
+        ];
+        for (bad, field) in cases {
+            assert_eq!(invalid_field(vault.add(bad)), Some(field));
+        }
+        assert_eq!(vault.services(), vec!["service1"]);
+    }
+
+    // service and username are stored trimmed, the password exactly as typed
+    #[test]
+    fn add_stores_trimmed_service_and_username_but_not_password() {
+        let mut vault = Vault::default();
+
+        vault
+            .add(credential_with("  github ", " alice ", " a "))
+            .unwrap();
+
+        let stored = vault.get("github").unwrap();
+        assert_eq!(stored.username, "alice");
+        assert_eq!(stored.password, " a ");
+    }
+
+    // "github " must count as the existing "github", not a second entry
+    #[test]
+    fn add_detects_duplicate_after_trimming() {
+        let mut vault = vault_multiple(&["github"]);
+
+        let result = vault.add(credential_with(" github ", "user", "pass"));
+
+        assert_eq!(result, Err(VaultError::DuplicateService));
+        assert_eq!(vault.services(), vec!["github"]);
+    }
+
+    #[test]
+    fn update_username_changes_only_that_field() {
+        let mut vault = vault_multiple(&["service1", "service2"]);
+
+        vault.update_username("service1", " bob ").unwrap();
+
+        assert_eq!(
+            vault.get("service1"),
+            Some(&credential_with("service1", "bob", "pass"))
+        );
+        assert_eq!(vault.get("service2"), Some(&credential("service2")));
+    }
+
+    #[test]
+    fn update_password_changes_only_that_field() {
+        let mut vault = vault_multiple(&["service1", "service2"]);
+
+        vault
+            .update_password("service1", Zeroizing::new(" new pass ".to_string()))
+            .unwrap();
+
+        assert_eq!(
+            vault.get("service1"),
+            Some(&credential_with("service1", "user", " new pass "))
+        );
+        assert_eq!(vault.get("service2"), Some(&credential("service2")));
+    }
+
+    #[test]
+    fn update_unknown_service_is_not_found() {
+        let mut vault = vault_multiple(&["service1"]);
+
+        assert_eq!(
+            vault.update_username("missing", "bob"),
+            Err(VaultError::NotFound)
+        );
+        assert_eq!(
+            vault.update_password("missing", Zeroizing::new("new".to_string())),
+            Err(VaultError::NotFound)
+        );
+    }
+
+    // a rejected update must leave the old value in place, not a half-written one
+    #[test]
+    fn update_rejects_invalid_values() {
+        let mut vault = vault_multiple(&["service1"]);
+
+        assert_eq!(
+            invalid_field(vault.update_username("service1", "a\x1b[31m")),
+            Some(Field::Username)
+        );
+        assert_eq!(
+            invalid_field(vault.update_password("service1", Zeroizing::new(String::new()))),
+            Some(Field::Password)
+        );
+        assert_eq!(vault.get("service1"), Some(&credential("service1")));
     }
 }
