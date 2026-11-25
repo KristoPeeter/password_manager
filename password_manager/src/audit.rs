@@ -2,11 +2,29 @@
 // only the tests use this module
 #![allow(dead_code)]
 
-use std::{io, path::PathBuf};
+use std::{
+    fs::{self, File},
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::paths::{DataDir, Username};
-use crate::vault::access::AccessCheck;
+use crate::vault::access::{self, AccessCheck, AccessError};
 use crate::vault::validation::Field;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+const MAX_LOG_BYTES: u64 = 1024 * 1024;
+// read_chain refuses anything this big: a real file is at most the limit plus one line
+const MAX_READ_BYTES: u64 = 16 * MAX_LOG_BYTES;
+// enough to hold the last few lines when looking up the previous seq and hash
+const TAIL_BYTES: u64 = 64 * 1024;
+// what the very first line links to
+const GENESIS: [u8; 32] = [0; 32];
 
 // unknown users have no attempts file, so only a wrong password for a real user has a count
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -22,8 +40,17 @@ pub enum TamperProblem {
     SealedEntryMissing,
 }
 
-// one variant per row of the spec's event table. every field is a number or a fixed name, never
-// a string from input or a path: that is what keeps secrets out of the log
+impl TamperProblem {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TamperProblem::ChainBroken => "chain_broken",
+            TamperProblem::SealMismatch => "seal_mismatch",
+            TamperProblem::SealedEntryMissing => "sealed_entry_missing",
+        }
+    }
+}
+
+// one variant per row of the spec's event table. every field is a number or a fixed name, never a string from input or a path: that is what keeps secrets out of the log
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Event {
     AppStart,
@@ -49,17 +76,121 @@ pub enum Event {
 
 impl Event {
     pub fn name(&self) -> &'static str {
-        todo!("task 8")
+        match self {
+            Event::AppStart => "app_start",
+            Event::AppExit { .. } => "app_exit",
+            Event::UserCreated => "user_created",
+            Event::UnlockSucceeded => "unlock_succeeded",
+            Event::UnlockFailed(_) => "unlock_failed",
+            Event::LockoutStarted { .. } => "lockout_started",
+            Event::UnlockRefusedLocked { .. } => "unlock_refused_locked",
+            Event::SessionAlreadyOpen => "session_already_open",
+            Event::CredentialsListed => "credentials_listed",
+            Event::CredentialAdded => "credential_added",
+            Event::CredentialUpdated { .. } => "credential_updated",
+            Event::CredentialDeleted => "credential_deleted",
+            Event::PasswordCopied => "password_copied",
+            Event::ClipboardUnavailable => "clipboard_unavailable",
+            Event::IntegrityCheckFailed => "integrity_check_failed",
+            Event::AccessDenied { .. } => "access_denied",
+            Event::ValidationRejected { .. } => "validation_rejected",
+            Event::IoError { .. } => "io_error",
+            Event::LogTamperDetected { .. } => "log_tamper_detected",
+        }
     }
 
     pub fn level(&self) -> &'static str {
-        todo!("task 8")
+        match self {
+            Event::UnlockFailed(_)
+            | Event::LockoutStarted { .. }
+            | Event::UnlockRefusedLocked { .. }
+            | Event::SessionAlreadyOpen
+            | Event::ClipboardUnavailable => "warn",
+            Event::IntegrityCheckFailed
+            | Event::AccessDenied { .. }
+            | Event::IoError { .. }
+            | Event::LogTamperDetected { .. } => "error",
+            _ => "info",
+        }
     }
+
+    fn extras(&self) -> Extras {
+        let mut extras = Extras::default();
+        match *self {
+            Event::AppExit { code } => extras.code = Some(code),
+            Event::UnlockFailed(UnlockFailure::BadCredentials { failures }) => {
+                extras.reason = Some("bad_credentials");
+                extras.failures = Some(failures);
+            }
+            Event::UnlockFailed(UnlockFailure::UnknownUser) => {
+                extras.reason = Some("unknown_user");
+            }
+            Event::LockoutStarted { locked_secs } => extras.locked_secs = Some(locked_secs),
+            Event::UnlockRefusedLocked { remaining_secs } => {
+                extras.remaining_secs = Some(remaining_secs);
+            }
+            Event::CredentialUpdated { field } | Event::ValidationRejected { field } => {
+                extras.field = Some(field.as_str());
+            }
+            Event::AccessDenied { check } => extras.check = Some(check.as_str()),
+            // the kind's name only: an io error's own message can contain a path
+            Event::IoError { kind } => extras.kind = Some(format!("{kind:?}")),
+            Event::LogTamperDetected { problem } => extras.problem = Some(problem.as_str()),
+            _ => {}
+        }
+        extras
+    }
+}
+
+// the field order here is the order in the file
+#[derive(Serialize)]
+struct Line<'a> {
+    seq: u64,
+    ts: u64,
+    level: &'static str,
+    event: &'static str,
+    user: Option<&'a str>,
+    #[serde(flatten)]
+    extras: Extras,
+    prev: String,
+}
+
+#[derive(Default, Serialize)]
+struct Extras {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failures: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    locked_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remaining_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    problem: Option<&'static str>,
+}
+
+// what read_chain needs from a line; the extras are covered by the hash
+#[derive(Deserialize)]
+struct Stored {
+    seq: u64,
+    user: Option<String>,
+    event: String,
+    prev: String,
 }
 
 pub struct Logger {
     log: PathBuf,
     rotated: PathBuf,
+    // appends are serialised on this file, not on events.log: rotation renames events.log, and a writer waiting on the old file would then append to events.log.1
+    lock: PathBuf,
     clock: fn() -> u64,
     max_bytes: u64,
     available: bool,
@@ -68,25 +199,137 @@ pub struct Logger {
 impl Logger {
     // never fails: a log that can't be used leaves the logger unavailable, and the app goes on
     pub fn open(dir: &DataDir, clock: fn() -> u64) -> Self {
-        let _ = (dir, clock);
-        todo!("task 8")
+        Self::open_with_limit(dir, clock, MAX_LOG_BYTES)
     }
 
     // the rotation size is a parameter only so the tests don't need to write a megabyte
     pub(crate) fn open_with_limit(dir: &DataDir, clock: fn() -> u64, max_bytes: u64) -> Self {
-        let _ = (dir, clock, max_bytes);
-        todo!("task 8")
+        let log = dir.log_file();
+        let lock = log.with_extension("log.lock");
+        let available = open_private(&log).is_ok() && access::check_file(&log).is_ok();
+        Self {
+            log,
+            rotated: dir.rotated_log_file(),
+            lock,
+            clock,
+            max_bytes,
+            available,
+        }
     }
 
     pub fn is_available(&self) -> bool {
-        todo!("task 8")
+        self.available
     }
 
     // best-effort: never panics, never returns an error
     pub fn log(&self, user: Option<&Username>, event: Event) {
-        let _ = (user, event);
-        todo!("task 8")
+        if self.available {
+            let _ = self.append(user, event);
+        }
     }
+
+    fn append(&self, user: Option<&Username>, event: Event) -> io::Result<()> {
+        // held until the end of this call; the os releases it if the process dies
+        let lock = open_private(&self.lock)?;
+        lock.lock()?;
+
+        // checked on every append, not only at open: the file may have been swapped since
+        match access::check_file(&self.log) {
+            Ok(()) => {}
+            Err(AccessError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(io::Error::other("log refused")),
+        }
+        if fs::metadata(&self.log).is_ok_and(|m| m.len() > self.max_bytes) {
+            fs::rename(&self.log, &self.rotated)?;
+        }
+
+        // the new line links to the last line of events.log, or after a rotation to the last line of events.log.1
+        let (last, unterminated) = match tail(&self.log)? {
+            Some(tail) => (Some(tail.last), !tail.terminated),
+            None => (tail(&self.rotated)?.map(|t| t.last), false),
+        };
+        let (seq, prev) = last.unwrap_or((0, GENESIS));
+        let line = serde_json::to_string(&Line {
+            seq: seq + 1,
+            ts: (self.clock)(),
+            level: event.level(),
+            event: event.name(),
+            user: user.map(Username::as_str),
+            extras: event.extras(),
+            prev: hex(&prev),
+        })
+        .map_err(io::Error::other)?;
+
+        let mut out = String::with_capacity(line.len() + 2);
+        // after a crash mid-append, the new line must not be glued to the fragment
+        if unterminated {
+            out.push('\n');
+        }
+        out.push_str(&line);
+        out.push('\n');
+        let mut file = open_private(&self.log)?;
+        file.write_all(out.as_bytes())?;
+        drop(lock);
+        Ok(())
+    }
+}
+
+// append mode, 0600 when created, and never through a symlink
+fn open_private(path: &Path) -> io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    }
+    options.open(path)
+}
+
+struct Tail {
+    // seq of the last line that parses, and the hash of the last line's exact bytes
+    last: (u64, [u8; 32]),
+    terminated: bool,
+}
+
+// reads only the end of the file: the last line is all an append needs
+fn tail(path: &Path) -> io::Result<Option<Tail>> {
+    let meta = match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        result => result?,
+    };
+    if !meta.is_file() {
+        return Err(io::Error::other("log is not a regular file"));
+    }
+    if meta.len() == 0 {
+        return Ok(None);
+    }
+    let start = meta.len().saturating_sub(TAIL_BYTES);
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(TAIL_BYTES).read_to_end(&mut bytes)?;
+
+    let terminated = bytes.last() == Some(&b'\n');
+    let body = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    let mut lines: Vec<&[u8]> = body.split(|b| *b == b'\n').collect();
+    // reading from the middle of the file starts mid-line
+    if start > 0 && lines.len() > 1 {
+        lines.remove(0);
+    }
+    let Some(last) = lines.last() else {
+        return Ok(None);
+    };
+    // a damaged last line still gets linked to; its seq comes from the nearest good line
+    let seq = lines
+        .iter()
+        .rev()
+        .find_map(|line| serde_json::from_slice::<Stored>(line).ok())
+        .map_or(0, |stored| stored.seq);
+    Ok(Some(Tail {
+        last: (seq, sha256(last)),
+        terminated,
+    }))
 }
 
 pub(crate) struct Entry {
@@ -98,8 +341,57 @@ pub(crate) struct Entry {
 
 // events.log.1 then events.log, every seq and prev link checked
 pub(crate) fn read_chain(dir: &DataDir) -> Result<Vec<Entry>, TamperProblem> {
-    let _ = dir;
-    todo!("task 8")
+    let mut entries: Vec<Entry> = Vec::new();
+    for path in [dir.rotated_log_file(), dir.log_file()] {
+        let Some(bytes) = read_log(&path)? else {
+            continue;
+        };
+        let Some(body) = bytes.strip_suffix(b"\n") else {
+            // empty is fine; anything else must end with a complete line
+            if bytes.is_empty() {
+                continue;
+            }
+            return Err(TamperProblem::ChainBroken);
+        };
+        for line in body.split(|b| *b == b'\n') {
+            let stored: Stored =
+                serde_json::from_slice(line).map_err(|_| TamperProblem::ChainBroken)?;
+            // compared as text, in the exact form hex() writes, so each hash has one spelling
+            let linked = match entries.last() {
+                Some(before) => stored.seq == before.seq + 1 && stored.prev == hex(&before.hash),
+                // the oldest line kept: its predecessor may have rotated away, unless it is the very first line
+                None => stored.seq > 1 || (stored.seq == 1 && stored.prev == hex(&GENESIS)),
+            };
+            if !linked {
+                return Err(TamperProblem::ChainBroken);
+            }
+            entries.push(Entry {
+                seq: stored.seq,
+                hash: sha256(line),
+                user: stored.user,
+                event: stored.event,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn read_log(path: &Path) -> Result<Option<Vec<u8>>, TamperProblem> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Ok(meta) if meta.is_file() && meta.len() <= MAX_READ_BYTES => fs::read(path)
+            .map(Some)
+            .map_err(|_| TamperProblem::ChainBroken),
+        _ => Err(TamperProblem::ChainBroken),
+    }
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
