@@ -343,7 +343,10 @@ mod tests {
         // the data folder is a link
         let link = dir.path().join("link");
         symlink(base(&real), &link).unwrap();
-        assert!(DataDir::at(link).ensure().is_err(), "symlinked base accepted");
+        assert!(
+            DataDir::at(link).ensure().is_err(),
+            "symlinked base accepted"
+        );
 
         // users/ is a link
         let data = DataDir::at(dir.path().join("securevault"));
@@ -351,6 +354,48 @@ mod tests {
         std::fs::remove_dir(base(&data).join("users")).unwrap();
         symlink(base(&real).join("users"), base(&data).join("users")).unwrap();
         assert!(data.ensure().is_err(), "symlinked users/ accepted");
+    }
+
+    // lstat follows a symlink when the path ends in "/" or "/.", which would hide a symlinked
+    // data folder from the checks, so the override is stored without them. compared as raw
+    // strings: Path equality ignores trailing slashes, which is exactly the problem
+    #[test]
+    fn env_override_is_normalised() {
+        for (input, expected) in [
+            ("/abs/dir/", "/abs/dir"),
+            ("/abs/dir/.", "/abs/dir"),
+            ("/abs/./dir//", "/abs/dir"),
+        ] {
+            let data = DataDir::resolve_from(Some(input.into()), None).unwrap();
+            assert_eq!(base(&data).as_os_str(), expected, "{input:?}");
+        }
+    }
+
+    // ".." makes the real location depend on what the parent turns out to be, after symlinks
+    #[test]
+    fn env_override_with_parent_component_is_refused() {
+        for input in ["/abs/../dir", "/abs/dir/.."] {
+            assert!(
+                DataDir::resolve_from(Some(input.into()), None).is_err(),
+                "{input:?} accepted"
+            );
+        }
+    }
+
+    // a refused data folder must be refused before anything is created inside it
+    #[cfg(unix)]
+    #[test]
+    fn ensure_through_a_symlink_creates_nothing() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("link");
+        symlink(&target, &link).unwrap();
+
+        assert!(DataDir::at(link).ensure().is_err());
+        let created: Vec<_> = std::fs::read_dir(&target).unwrap().collect();
+        assert!(created.is_empty(), "created inside the target: {created:?}");
     }
 
     // running ensure on every start must not fail once the folders exist

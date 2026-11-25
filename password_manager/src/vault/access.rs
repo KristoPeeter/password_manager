@@ -76,6 +76,7 @@ fn check(path: &Path, expect_dir: bool) -> Result<(), AccessError> {
 }
 
 // windows has no unix owner or mode bits. ACL is not checked
+#[cfg(not(unix))]
 fn check(_path: &Path, _expect_dir: bool) -> Result<(), AccessError> {
     Ok(())
 }

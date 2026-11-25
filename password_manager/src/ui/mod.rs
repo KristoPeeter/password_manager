@@ -114,7 +114,6 @@ pub fn run() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-
     // try_exists, not exists: a permission error must not look like "no vault yet"
     let session = match data.user_file(&user, UserFile::Vault).try_exists() {
         Ok(false) => match create_vault(&data, &user) {

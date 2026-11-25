@@ -187,7 +187,8 @@ fn encrypt_vault(
     };
     let aad = serde_json::to_vec(&header).map_err(|_| StorageError::Unlock)?;
     let plaintext = Zeroizing::new(serde_json::to_vec(vault).map_err(|_| StorageError::Unlock)?);
-    let ciphertext = crypto::encrypt(key, &nonce, &aad, &plaintext).map_err(|_| StorageError::Unlock)?;
+    let ciphertext =
+        crypto::encrypt(key, &nonce, &aad, &plaintext).map_err(|_| StorageError::Unlock)?;
     let file = VaultFile {
         header,
         ciphertext: B64.encode(ciphertext),
@@ -1126,7 +1127,11 @@ mod tests {
                 set_mode(&folder, mode);
                 let case = format!("{parent:?} {mode:o}");
 
-                assert_eq!(access_denied(load(&session)), Some(AccessCheck::Mode), "{case}");
+                assert_eq!(
+                    access_denied(load(&session)),
+                    Some(AccessCheck::Mode),
+                    "{case}"
+                );
                 assert_eq!(
                     access_denied(save(&session, &vault_with_github())),
                     Some(AccessCheck::Mode),
@@ -1280,6 +1285,54 @@ mod tests {
         let error = create_user_with_params(&data, &user("alice"), PW, KdfParams::TEST).err();
 
         assert!(matches!(error, Some(StorageError::Io(_))), "{error:?}");
+    }
+
+    // --- SECURITY_REVIEW.md fixes ---
+
+    // lstat follows a symlink when the path ends in "/" or "/.", so a SECUREVAULT_HOME written
+    // that way must not slip a symlinked data folder past the check
+    #[cfg(unix)]
+    #[test]
+    fn trailing_slash_does_not_hide_a_symlinked_data_folder() {
+        use std::os::unix::fs::symlink;
+        let (dir, real) = data_dir();
+        drop(new_user(&real, "alice"));
+        let link = dir.path().join("link");
+        symlink(dir.path().join("securevault"), &link).unwrap();
+
+        for suffix in ["/", "/."] {
+            let env = format!("{}{suffix}", link.display());
+            let data = DataDir::resolve_from(Some(env.into()), None).unwrap();
+            assert_eq!(
+                access_denied(unlock(&data, &user("alice"), PW)),
+                Some(AccessCheck::Symlink),
+                "{suffix:?}"
+            );
+        }
+    }
+
+    // the vault belongs to the user whose folder it was made in: a copy dropped into another
+    // user's folder must not open there, or one user's vault could be passed off as another's
+    #[test]
+    fn vault_moved_to_another_user_is_refused() {
+        let (_dir, data) = data_dir();
+        drop(new_user(&data, "alice"));
+        drop(
+            create_user_with_params(&data, &user("bob"), "bob's password", KdfParams::TEST)
+                .unwrap(),
+        );
+        fs::copy(vault_path(&data, "alice"), vault_path(&data, "bob")).unwrap();
+
+        assert!(matches!(
+            unlock(&data, &user("bob"), PW),
+            Err(StorageError::Unlock)
+        ));
+        assert!(matches!(
+            unlock(&data, &user("bob"), "bob's password"),
+            Err(StorageError::Unlock)
+        ));
+        // the original is unaffected
+        assert!(unlock(&data, &user("alice"), PW).is_ok());
     }
 
     // --- messages ---

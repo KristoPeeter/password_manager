@@ -196,6 +196,21 @@ mod tests {
         assert_eq!(read(&fake), None);
     }
 
+    // a read that fails when the timer fires must not make the app forget the password:
+    // exit still has to clear it
+    #[test]
+    fn failed_read_at_timeout_still_clears_on_exit() {
+        let (clipboard, fake) = manager();
+
+        clipboard.copy("pw1").unwrap();
+        fake.fail.store(true, Ordering::SeqCst);
+        sleep(Duration::from_millis(300));
+        fake.fail.store(false, Ordering::SeqCst);
+        clipboard.clear_if_unchanged();
+
+        assert_eq!(read(&fake), None);
+    }
+
     // on exit the clipboard is wiped right away, no waiting
     #[test]
     fn clear_if_unchanged_clears_immediately() {
