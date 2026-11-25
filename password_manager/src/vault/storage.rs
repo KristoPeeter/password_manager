@@ -111,6 +111,7 @@ impl Session {
 #[serde(deny_unknown_fields)]
 struct Header {
     version: u32,
+    user: String, //the owner, compared with the folder the vault was found in. the header is authenticated, so a vault copied into another user's folder can't be relabelled to match
     kdf: KdfParams,
     salt: String,
     nonce: String,
@@ -130,6 +131,15 @@ fn check_user_paths(dir: &DataDir, user_dir: &Path, vault: &Path) -> Result<(), 
     access::check_dir(user_dir)?;
     access::check_file(vault)?;
     Ok(())
+}
+
+// the owner check runs before any key derivation, so a misplaced vault costs no argon2 work
+fn read_file_for(path: &Path, user: &Username) -> Result<VaultFile, StorageError> {
+    let file = read_file(path)?;
+    if file.header.user != user.as_str() {
+        return Err(StorageError::Unlock);
+    }
+    Ok(file)
 }
 
 fn decode<const N: usize>(s: &str) -> Result<[u8; N], StorageError> {
@@ -173,6 +183,7 @@ fn decrypt_vault(file: &VaultFile, key: &Key) -> Result<Vault, StorageError> {
 
 fn encrypt_vault(
     vault: &Vault,
+    user: &Username,
     key: &Key,
     salt: &[u8; SALT_LEN],
     params: KdfParams,
@@ -181,6 +192,7 @@ fn encrypt_vault(
     let nonce = crypto::random_bytes::<NONCE_LEN>();
     let header = Header {
         version: VERSION,
+        user: user.as_str().to_string(),
         kdf: params,
         salt: B64.encode(salt),
         nonce: B64.encode(nonce),
@@ -272,7 +284,7 @@ pub(crate) fn create_user_with_params(
     let result = (|| {
         let salt = crypto::random_bytes::<SALT_LEN>();
         let key = derive(password, &salt, &params)?;
-        let bytes = encrypt_vault(&Vault::default(), &key, &salt, params)?;
+        let bytes = encrypt_vault(&Vault::default(), user, &key, &salt, params)?;
         match write_atomically(&vault, &bytes, false) {
             Err(StorageError::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(StorageError::UserExists);
@@ -310,7 +322,7 @@ pub fn unlock(dir: &DataDir, user: &Username, password: &str) -> Result<Session,
     let user_dir = dir.user_dir(user);
     let vault = dir.user_file(user, UserFile::Vault);
     let file = check_user_paths(dir, &user_dir, &vault)
-        .and_then(|()| read_file(&vault))
+        .and_then(|()| read_file_for(&vault, user))
         .map_err(missing_means_unknown_user)?;
     let salt = decode::<SALT_LEN>(&file.header.salt)?;
     let params = file.header.kdf;
@@ -341,12 +353,18 @@ pub(crate) fn dummy_unlock(password: &str) {
 
 pub fn load(session: &Session) -> Result<Vault, StorageError> {
     session.check_access()?;
-    decrypt_vault(&read_file(&session.vault)?, &session.key)
+    decrypt_vault(&read_file_for(&session.vault, &session.user)?, &session.key)
 }
 
 pub fn save(session: &Session, vault: &Vault) -> Result<(), StorageError> {
     session.check_access()?;
-    let bytes = encrypt_vault(vault, &session.key, &session.salt, session.params)?;
+    let bytes = encrypt_vault(
+        vault,
+        &session.user,
+        &session.key,
+        &session.salt,
+        session.params,
+    )?;
     // read_file refuses anything over the limit, so writing it would lock the user out of their vault
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(StorageError::TooLarge);
@@ -375,6 +393,10 @@ fn write_atomically(path: &Path, bytes: &[u8], overwrite: bool) -> Result<(), St
         // fails if anything already exists at path
         tmp.persist_noclobber(path).map_err(|e| e.error)?;
     }
+    // the rename itself lives in the folder's entry list; without syncing the folder a crash
+    // right after could bring back the old vault, or no vault at all for a new user
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 

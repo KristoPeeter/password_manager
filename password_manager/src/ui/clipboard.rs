@@ -42,16 +42,16 @@ fn lock<B>(state: &Mutex<State<B>>) -> MutexGuard<'_, State<B>> {
 }
 
 fn clear_if_pending<B: ClipboardBackend>(state: &mut State<B>) {
-    if let Some(pending) = state.pending.take() {
-        let still_ours = state
-            .backend
-            .get_text()
-            .map(Zeroizing::new)
-            .is_ok_and(|current| *current == *pending);
-        if still_ours {
-            let _ = state.backend.clear();
-        }
+    let Some(pending) = state.pending.as_ref() else {
+        return;
+    };
+    let Ok(current) = state.backend.get_text().map(Zeroizing::new) else {
+        return;
+    };
+    if *current == **pending {
+        let _ = state.backend.clear();
     }
+    state.pending = None;
 }
 
 impl<B: ClipboardBackend> ClipboardManager<B> {

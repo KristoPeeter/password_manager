@@ -1,7 +1,7 @@
 use std::{
     ffi::OsString,
     fmt, fs, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 #[cfg(unix)]
@@ -86,6 +86,7 @@ impl Username {
 pub enum PathsError {
     NoHome,
     NotAbsolute,
+    ParentComponent,
 }
 
 impl fmt::Display for PathsError {
@@ -93,6 +94,7 @@ impl fmt::Display for PathsError {
         match self {
             PathsError::NoHome => write!(f, "Couldn't find a folder to store data in"),
             PathsError::NotAbsolute => write!(f, "{ENV_OVERRIDE} must be an absolute path"),
+            PathsError::ParentComponent => write!(f, "{ENV_OVERRIDE} must not contain \"..\""),
         }
     }
 }
@@ -111,19 +113,21 @@ impl DataDir {
         env: Option<OsString>,
         default: Option<PathBuf>,
     ) -> Result<Self, PathsError> {
-        match env {
+        let base = match env {
             Some(value) => {
                 let base = PathBuf::from(value);
-                if base.is_absolute() {
-                    Ok(Self(base))
-                } else {
-                    Err(PathsError::NotAbsolute)
+                if !base.is_absolute() {
+                    return Err(PathsError::NotAbsolute);
                 }
+                base
             }
-            None => default
-                .map(|dir| Self(dir.join(APP_FOLDER)))
-                .ok_or(PathsError::NoHome),
+            None => default.ok_or(PathsError::NoHome)?.join(APP_FOLDER),
+        };
+        if base.components().any(|c| c == Component::ParentDir) {
+            return Err(PathsError::ParentComponent);
         }
+        // drop a trailing "/" or "/.", which would let a symlinked data folder pass the checks
+        Ok(Self(base.components().collect()))
     }
 
     #[cfg(test)]
@@ -134,9 +138,12 @@ impl DataDir {
     // existing folders are checked, not fixed: a loose or linked one may have been prepared by
     // someone else, and changing its mode would hide that
     pub fn ensure(&self) -> Result<(), AccessError> {
+        // each folder is checked before anything is made inside it, so a refused folder is left
+        // exactly as it was found
         create_private_dir(&self.0)?;
+        access::check_dir(&self.0)?;
         create_private_dir(&self.users_dir())?;
-        self.check_folders()
+        access::check_dir(&self.users_dir())
     }
 
     // whoever can write the data folder or users/ can swap a user folder, so these are checked
