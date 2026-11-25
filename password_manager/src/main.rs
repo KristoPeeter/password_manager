@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 mod actions;
 mod audit;
+mod hardening;
 mod paths;
 mod ui;
 mod vault;
