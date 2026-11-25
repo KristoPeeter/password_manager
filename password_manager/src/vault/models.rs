@@ -15,6 +15,9 @@ pub struct Credential {
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct Vault {
     credentials: Vec<Credential>,
+    // default: vaults saved before the log seal existed read as never sealed
+    #[serde(default)]
+    log_sealed: bool,
 }
 #[derive(Debug, PartialEq)]
 pub enum VaultError {
@@ -42,12 +45,12 @@ impl Vault {
     // set after the first log seal, so a deleted log.seal can't pass for a first login
     #[allow(dead_code)] // the login screen, task 11
     pub fn log_sealed(&self) -> bool {
-        todo!("task 9")
+        self.log_sealed
     }
 
     #[allow(dead_code)] // the login screen, task 11
     pub fn mark_log_sealed(&mut self) {
-        todo!("task 9")
+        self.log_sealed = true;
     }
 
     pub fn get(&self, service: &str) -> Option<&Credential> {

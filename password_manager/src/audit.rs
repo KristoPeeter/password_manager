@@ -6,14 +6,18 @@ use std::{
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
 };
+
+use hmac::{Hmac, KeyInit, Mac};
+use zeroize::Zeroizing;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::paths::{DataDir, Username};
+use crate::paths::{DataDir, UserFile, Username};
 use crate::vault::access::{self, AccessCheck, AccessError};
-use crate::vault::storage::Session;
+use crate::vault::storage::{Session, write_atomically};
 use crate::vault::validation::Field;
 
 #[cfg(unix)]
@@ -26,6 +30,12 @@ const MAX_READ_BYTES: u64 = 16 * MAX_LOG_BYTES;
 const TAIL_BYTES: u64 = 64 * 1024;
 // what the very first line links to
 const GENESIS: [u8; 32] = [0; 32];
+// a separate key for the seal, so the vault key itself is never used for anything else
+const SEAL_CONTEXT: &[u8] = b"securevault log seal v1";
+// a real seal is about 200 bytes
+const MAX_SEAL_BYTES: u64 = 1024;
+
+type HmacSha256 = Hmac<Sha256>;
 
 // unknown users have no attempts file, so only a wrong password for a real user has a count
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -195,6 +205,23 @@ pub struct Logger {
     clock: fn() -> u64,
     max_bytes: u64,
     available: bool,
+    dir: DataDir,
+    // Some while a user is logged in: every event then moves their seal to the newest line
+    seal: Mutex<Option<ActiveSeal>>,
+}
+
+struct ActiveSeal {
+    key: Zeroizing<[u8; 32]>,
+    path: PathBuf,
+}
+
+// what log.seal holds; the mac covers seq and hash, so neither can be changed without the key
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealFile {
+    seq: u64,
+    hash: String,
+    mac: String,
 }
 
 impl Logger {
@@ -215,6 +242,8 @@ impl Logger {
             clock,
             max_bytes,
             available,
+            dir: dir.clone(),
+            seal: Mutex::new(None),
         }
     }
 
@@ -224,12 +253,23 @@ impl Logger {
 
     // best-effort: never panics, never returns an error
     pub fn log(&self, user: Option<&Username>, event: Event) {
-        if self.available {
-            let _ = self.append(user, event);
+        if !self.available {
+            return;
+        }
+        if let Ok(written) = self.append(user, event)
+            && let Some(seal) = self.active_seal().as_ref()
+        {
+            let _ = write_seal(seal, written);
         }
     }
 
-    fn append(&self, user: Option<&Username>, event: Event) -> io::Result<()> {
+    // a poisoned lock only means another thread panicked while holding it; the seal is still usable
+    fn active_seal(&self) -> MutexGuard<'_, Option<ActiveSeal>> {
+        self.seal.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // returns the seq and hash of the line it wrote, for the seal
+    fn append(&self, user: Option<&Username>, event: Event) -> io::Result<(u64, [u8; 32])> {
         // held until the end of this call; the os releases it if the process dies
         let lock = open_private(&self.lock)?;
         lock.lock()?;
@@ -257,7 +297,7 @@ impl Logger {
             event: event.name(),
             user: user.map(Username::as_str),
             extras: event.extras(),
-            prev: hex(&prev),
+            prev: hex::encode(prev),
         })
         .map_err(io::Error::other)?;
 
@@ -271,12 +311,12 @@ impl Logger {
         let mut file = open_private(&self.log)?;
         file.write_all(out.as_bytes())?;
         drop(lock);
-        Ok(())
+        Ok((seq + 1, sha256(line.as_bytes())))
     }
 }
 
 // what the log check at login found
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LogCheck {
     Clean {
         failed_attempts_since_last_session: u32,
@@ -287,13 +327,155 @@ pub enum LogCheck {
 impl Logger {
     // checks the log against this user's seal, then keeps the seal on the newest line for as long as the session lasts. vault_says_sealed comes from the vault, so deleting log.seal can't pass for a first login
     pub fn begin_session(&self, session: &Session, vault_says_sealed: bool) -> LogCheck {
-        let _ = (session, vault_says_sealed);
-        todo!("task 9")
+        let user = session.user();
+        let seal = ActiveSeal {
+            key: seal_key(session.key().as_slice()),
+            path: self.dir.user_file(user, UserFile::Seal),
+        };
+        let (check, last_verified) = self.check(&seal, user, vault_says_sealed);
+
+        // the seal moves on either way, so a warning is given once and not at every login
+        match (check, last_verified) {
+            // the last line the check itself verified, not whatever was appended since
+            (LogCheck::Clean { .. }, Some(last)) => {
+                let _ = write_seal(&seal, last);
+            }
+            (LogCheck::Clean { .. }, None) => {
+                let _ = write_seal(&seal, (0, GENESIS));
+            }
+            // nothing was verified: seal whatever the log ends with now
+            (LogCheck::Tampered(_), _) => {
+                let _ = write_seal(&seal, self.last_line().unwrap_or((0, GENESIS)));
+            }
+        }
+        *self.active_seal() = Some(seal);
+        // logged after sealing starts, so the seal moves onto the warning itself
+        if let LogCheck::Tampered(problem) = check {
+            self.log(Some(user), Event::LogTamperDetected { problem });
+        }
+        check
     }
 
-    // stops sealing and wipes the seal key
+    // stops sealing; dropping the ActiveSeal wipes the key
     pub fn end_session(&self) {
-        todo!("task 9")
+        *self.active_seal() = None;
+    }
+
+    // also returns the last line of the verified chain, which is what a clean check seals
+    fn check(
+        &self,
+        seal: &ActiveSeal,
+        user: &Username,
+        vault_says_sealed: bool,
+    ) -> (LogCheck, Option<(u64, [u8; 32])>) {
+        let entries = match read_chain(&self.dir) {
+            Ok(entries) => entries,
+            Err(problem) => return (LogCheck::Tampered(problem), None),
+        };
+        let last = entries.last().map(|e| (e.seq, e.hash));
+        let sealed_seq = match read_seal(&seal.path) {
+            // no seal yet: a first login, unless the vault says there was one
+            Ok(None) if !vault_says_sealed => {
+                let clean = LogCheck::Clean {
+                    failed_attempts_since_last_session: 0,
+                };
+                return (clean, last);
+            }
+            Ok(None) | Err(()) => {
+                return (LogCheck::Tampered(TamperProblem::SealMismatch), None);
+            }
+            Ok(Some(stored)) => match verify_seal(seal, &stored, &entries) {
+                Ok(seq) => seq,
+                Err(problem) => return (LogCheck::Tampered(problem), None),
+            },
+        };
+
+        // only this user's own failures, and only those after their last session
+        let failed = entries
+            .iter()
+            .filter(|e| e.seq > sealed_seq)
+            .filter(|e| e.event == "unlock_failed" && e.user.as_deref() == Some(user.as_str()))
+            .count();
+        let clean = LogCheck::Clean {
+            failed_attempts_since_last_session: u32::try_from(failed).unwrap_or(u32::MAX),
+        };
+        (clean, last)
+    }
+
+    fn last_line(&self) -> Option<(u64, [u8; 32])> {
+        match tail(&self.log) {
+            Ok(Some(tail)) => Some(tail.last),
+            _ => tail(&self.rotated).ok().flatten().map(|t| t.last),
+        }
+    }
+}
+
+// HMAC-SHA256(vault key, context), as the spec gives it
+fn seal_key(vault_key: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(vault_key)
+        .unwrap_or_else(|_| unreachable!("hmac takes a key of any length"));
+    mac.update(SEAL_CONTEXT);
+    Zeroizing::new(mac.finalize().into_bytes().into())
+}
+
+fn seal_mac(key: &[u8; 32], seq: u64, hash: &[u8; 32]) -> HmacSha256 {
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key)
+        .unwrap_or_else(|_| unreachable!("hmac takes a key of any length"));
+    mac.update(&seq.to_be_bytes());
+    mac.update(hash);
+    mac
+}
+
+fn write_seal(seal: &ActiveSeal, (seq, hash): (u64, [u8; 32])) -> io::Result<()> {
+    let mac = seal_mac(&seal.key, seq, &hash).finalize().into_bytes();
+    let file = SealFile {
+        seq,
+        hash: hex::encode(hash),
+        mac: hex::encode(mac),
+    };
+    let bytes = serde_json::to_vec(&file).map_err(io::Error::other)?;
+    write_atomically(&seal.path, &bytes, true)
+}
+
+// Ok(None): there is no seal. Err: there is something, but it isn't a seal
+fn read_seal(path: &Path) -> Result<Option<SealFile>, ()> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Ok(meta) if meta.is_file() && meta.len() <= MAX_SEAL_BYTES => {}
+        _ => return Err(()),
+    }
+    let bytes = fs::read(path).map_err(|_| ())?;
+    serde_json::from_slice(&bytes).map(Some).map_err(|_| ())
+}
+
+// the mac first, so nothing in an unauthenticated seal is trusted; then the sealed line itself.
+// returns the sealed seq
+fn verify_seal(
+    seal: &ActiveSeal,
+    stored: &SealFile,
+    entries: &[Entry],
+) -> Result<u64, TamperProblem> {
+    let mut hash = [0u8; 32];
+    let mut mac = [0u8; 32];
+    hex::decode_to_slice(&stored.hash, &mut hash).map_err(|_| TamperProblem::SealMismatch)?;
+    hex::decode_to_slice(&stored.mac, &mut mac).map_err(|_| TamperProblem::SealMismatch)?;
+    // verify_slice compares in constant time
+    seal_mac(&seal.key, stored.seq, &hash)
+        .verify_slice(&mac)
+        .map_err(|_| TamperProblem::SealMismatch)?;
+
+    // seq 0 is a seal over an empty log
+    if stored.seq == 0 {
+        return if hash == GENESIS {
+            Ok(0)
+        } else {
+            Err(TamperProblem::SealMismatch)
+        };
+    }
+    match entries.iter().find(|e| e.seq == stored.seq) {
+        None => Err(TamperProblem::SealedEntryMissing),
+        Some(entry) if entry.hash != hash => Err(TamperProblem::SealMismatch),
+        Some(_) => Ok(stored.seq),
     }
 }
 
@@ -381,9 +563,11 @@ pub(crate) fn read_chain(dir: &DataDir) -> Result<Vec<Entry>, TamperProblem> {
                 serde_json::from_slice(line).map_err(|_| TamperProblem::ChainBroken)?;
             // compared as text, in the exact form hex() writes, so each hash has one spelling
             let linked = match entries.last() {
-                Some(before) => stored.seq == before.seq + 1 && stored.prev == hex(&before.hash),
+                Some(before) => {
+                    stored.seq == before.seq + 1 && stored.prev == hex::encode(before.hash)
+                }
                 // the oldest line kept: its predecessor may have rotated away, unless it is the very first line
-                None => stored.seq > 1 || (stored.seq == 1 && stored.prev == hex(&GENESIS)),
+                None => stored.seq > 1 || (stored.seq == 1 && stored.prev == hex::encode(GENESIS)),
             };
             if !linked {
                 return Err(TamperProblem::ChainBroken);
@@ -411,10 +595,6 @@ fn read_log(path: &Path) -> Result<Option<Vec<u8>>, TamperProblem> {
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
-}
-
-fn hex(bytes: &[u8; 32]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
