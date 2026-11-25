@@ -1,7 +1,23 @@
 // the login flow (task 7) is the only caller; until then only the tests use this module
 #![allow(dead_code)]
 
-use std::{io, path::Path};
+use std::{
+    fs::{self, File},
+    io::{self, Read},
+    path::Path,
+};
+
+use serde::{Deserialize, Serialize};
+
+use super::storage::write_atomically;
+
+const LOCK_AFTER: u32 = 3;
+const BASE_COOLDOWN: u64 = 30;
+const MAX_COOLDOWN: u64 = 900;
+// the first count whose cooldown reaches the cap (30 s × 2^5 = 960 s)
+const MAX_LEVEL: u32 = 8;
+// the real file is about 50 bytes; anything far bigger is damage, not a count
+const MAX_FILE_BYTES: u64 = 1024;
 
 #[derive(Debug, PartialEq)]
 pub enum LockState {
@@ -17,26 +33,122 @@ pub struct Failure {
     pub locked_secs: Option<u64>,
 }
 
-// 0 below 3 failures, then 30 s doubling each time, capped at 15 minutes
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Attempts {
+    failures: u32,
+    last_failure: u64,
+}
+
+enum Stored {
+    Missing,
+    Found(Attempts),
+    Damaged, // unreadable, oversized, not a regular file, or not the expected json
+}
+
+// 0 below 3 failures, then 30 s doubling each time, capped at 15 minutes. the shift is capped
+// first: 30 << 5 is already past the cap, and a large shift would silently lose bits
 pub fn cooldown_secs(failures: u32) -> u64 {
-    let _ = failures;
-    todo!("task 6")
+    if failures < LOCK_AFTER {
+        return 0;
+    }
+    let doublings = (failures - LOCK_AFTER).min(5);
+    (BASE_COOLDOWN << doublings).min(MAX_COOLDOWN)
 }
 
 pub fn state(path: &Path, now: u64) -> LockState {
-    let _ = (path, now);
-    todo!("task 6")
+    let attempts = match read(path) {
+        Stored::Missing => return LockState::Open,
+        Stored::Found(attempts) => attempts,
+        Stored::Damaged => {
+            // damaging the file must cost the attacker, not reset the count
+            let attempts = Attempts {
+                failures: MAX_LEVEL,
+                last_failure: now,
+            };
+            // the lock holds for this call even if the repair can't be written
+            let _ = write(path, &attempts);
+            attempts
+        }
+    };
+    lock_state(&attempts, now)
 }
 
 pub fn record_failure(path: &Path, now: u64) -> io::Result<Failure> {
-    let _ = (path, now);
-    todo!("task 6")
+    let previous = match read(path) {
+        Stored::Missing => 0,
+        Stored::Found(attempts) => attempts.failures,
+        Stored::Damaged => MAX_LEVEL,
+    };
+    let failures = previous.saturating_add(1);
+    write(
+        path,
+        &Attempts {
+            failures,
+            last_failure: now,
+        },
+    )?;
+    let cooldown = cooldown_secs(failures);
+    Ok(Failure {
+        failures,
+        locked_secs: (cooldown > 0).then_some(cooldown),
+    })
 }
 
 // a missing file is Ok: there was nothing to clear
 pub fn clear(path: &Path) -> io::Result<()> {
-    let _ = path;
-    todo!("task 6")
+    match fs::remove_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+// only subtraction, never last_failure + cooldown, so no timestamp can overflow
+fn lock_state(attempts: &Attempts, now: u64) -> LockState {
+    let cooldown = cooldown_secs(attempts.failures);
+    if cooldown == 0 {
+        return LockState::Open;
+    }
+    // a clock earlier than the last failure can't measure the wait, so the full lock applies
+    let Some(elapsed) = now.checked_sub(attempts.last_failure) else {
+        return LockState::Locked {
+            remaining_secs: cooldown,
+        };
+    };
+    if elapsed >= cooldown {
+        LockState::Open
+    } else {
+        LockState::Locked {
+            remaining_secs: cooldown - elapsed,
+        }
+    }
+}
+
+fn read(path: &Path) -> Stored {
+    // checked before open: opening a fifo would block, and a link could point anywhere
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Stored::Missing,
+        Ok(meta) if meta.is_file() => {}
+        _ => return Stored::Damaged,
+    }
+    let Ok(file) = File::open(path) else {
+        return Stored::Damaged;
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > MAX_FILE_BYTES
+    {
+        return Stored::Damaged;
+    }
+    serde_json::from_slice(&bytes).map_or(Stored::Damaged, Stored::Found)
+}
+
+fn write(path: &Path, attempts: &Attempts) -> io::Result<()> {
+    let bytes = serde_json::to_vec(attempts).map_err(io::Error::other)?;
+    write_atomically(path, &bytes, true)
 }
 
 #[cfg(test)]

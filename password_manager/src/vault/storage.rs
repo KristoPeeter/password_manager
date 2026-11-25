@@ -286,7 +286,7 @@ pub(crate) fn create_user_with_params(
         let key = derive(password, &salt, &params)?;
         let bytes = encrypt_vault(&Vault::default(), user, &key, &salt, params)?;
         match write_atomically(&vault, &bytes, false) {
-            Err(StorageError::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists => {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(StorageError::UserExists);
             }
             result => result?,
@@ -369,11 +369,13 @@ pub fn save(session: &Session, vault: &Vault) -> Result<(), StorageError> {
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(StorageError::TooLarge);
     }
-    write_atomically(&session.vault, &bytes, true)
+    write_atomically(&session.vault, &bytes, true)?;
+    Ok(())
 }
 
 // writes a synced temp file and swaps it in
-fn write_atomically(path: &Path, bytes: &[u8], overwrite: bool) -> Result<(), StorageError> {
+// shared with the lockout file, which needs the same crash safety
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8], overwrite: bool) -> io::Result<()> {
     // same folder as the target, so the final rename never crosses filesystems
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
