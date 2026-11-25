@@ -1,13 +1,14 @@
 {
   "header": {
     "version": 2,
+    "user": "alice",
     "kdf": {
       "m_cost": 8192,
       "t_cost": 1,
       "p_cost": 1
     },
-    "salt": "Br0iqjfidgOc85J9hHmZyg==",
-    "nonce": "Hv0pwGn3HAv5AuYK"
+    "salt": "lk5LnDWdR5Di09pUOXEVeg==",
+    "nonce": "PeObTgxJm87K9UHU"
   },
-  "ciphertext": "oW/WnzPTfuc3ZsAmUFiv9gAWlWIGbzYfIBvNCQn5m/oxnbhNdNdlpC6hIfqD7uzEJI8du5JsX34BRMJCgD38npDFAjQXJhV9bPXzlBaNnKfUWvpMCq0k5V2m09mDMg=="
+  "ciphertext": "K0hFNu9F8I5bZWbiN/yzzX3WAeOy1kbjLv+lxLiXko614bRXfLlp7IqbrjE+J4InIO6rE4OM+1Wk8jn8/SmRqoALGRtaCv+SxJ8MPQ/OHMtTDcjHtmD2LhFXMOaGuw=="
 }
