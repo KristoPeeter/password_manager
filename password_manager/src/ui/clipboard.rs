@@ -4,6 +4,14 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
+// each platform names the "exclude from history" setting through its own trait
+#[cfg(target_os = "macos")]
+use arboard::SetExtApple as _;
+#[cfg(target_os = "linux")]
+use arboard::SetExtLinux as _;
+#[cfg(windows)]
+use arboard::SetExtWindows as _;
+
 pub const CLEAR_AFTER: Duration = Duration::from_secs(20);
 
 #[derive(Debug, PartialEq)]
@@ -16,7 +24,11 @@ pub trait ClipboardBackend: Send + 'static {
 }
 impl ClipboardBackend for arboard::Clipboard {
     fn set_text(&mut self, text: &str) -> Result<(), ClipboardError> {
-        arboard::Clipboard::set_text(self, text).map_err(|_| ClipboardError)
+        // marked sensitive, so clipboard-history tools and windows cloud clipboard skip it
+        self.set()
+            .exclude_from_history()
+            .text(text)
+            .map_err(|_| ClipboardError)
     }
     fn get_text(&mut self) -> Result<String, ClipboardError> {
         arboard::Clipboard::get_text(self).map_err(|_| ClipboardError)

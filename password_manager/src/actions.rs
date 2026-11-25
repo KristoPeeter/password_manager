@@ -7,12 +7,14 @@ use std::fmt;
 
 use zeroize::Zeroizing;
 
-use crate::audit::{LogCheck, Logger};
+use crate::audit::{Event, LogCheck, Logger, UnlockFailure};
 use crate::paths::{DataDir, Username};
 use crate::ui::clipboard::{ClipboardBackend, ClipboardManager};
-use crate::vault::auth::LoginError;
-use crate::vault::models::VaultError;
-use crate::vault::storage::{Session, StorageError};
+use crate::vault::auth::{self, LoginError};
+use crate::vault::crypto::KdfParams;
+use crate::vault::models::{Credential, Vault, VaultError};
+use crate::vault::storage::{self, Session, StorageError};
+use crate::vault::validation::Field;
 
 #[derive(Debug)]
 pub enum OpError {
@@ -23,8 +25,23 @@ pub enum OpError {
 
 impl fmt::Display for OpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = f;
-        todo!("task 10")
+        match self {
+            OpError::Vault(e) => write!(f, "{e}"),
+            OpError::Storage(e) => write!(f, "{e}"),
+            OpError::ClipboardUnavailable => write!(f, "Clipboard unavailable"),
+        }
+    }
+}
+
+impl From<VaultError> for OpError {
+    fn from(e: VaultError) -> Self {
+        OpError::Vault(e)
+    }
+}
+
+impl From<StorageError> for OpError {
+    fn from(e: StorageError) -> Self {
+        OpError::Storage(e)
     }
 }
 
@@ -47,8 +64,7 @@ pub fn create_user(
     user: &Username,
     password: &str,
 ) -> Result<LoggedIn, StorageError> {
-    let _ = (dir, log, user, password);
-    todo!("task 10")
+    create_user_with_params(dir, log, user, password, KdfParams::DEFAULT)
 }
 
 // the tests use cheap kdf parameters, as in storage
@@ -57,10 +73,19 @@ pub(crate) fn create_user_with_params(
     log: &Logger,
     user: &Username,
     password: &str,
-    params: crate::vault::crypto::KdfParams,
+    params: KdfParams,
 ) -> Result<LoggedIn, StorageError> {
-    let _ = (dir, log, user, password, params);
-    todo!("task 10")
+    let session = match storage::create_user_with_params(dir, user, password, params) {
+        Ok(session) => session,
+        Err(e) => {
+            // the user doesn't exist, so the log gets no name
+            log_storage_failure(log, None, &e);
+            return Err(e);
+        }
+    };
+    let check = start_log_session(log, &session)?;
+    log.log(Some(user), Event::UserCreated);
+    Ok(LoggedIn { session, check })
 }
 
 pub fn login(
@@ -70,13 +95,89 @@ pub fn login(
     password: &str,
     now: u64,
 ) -> Result<LoggedIn, LoginError> {
-    let _ = (dir, log, user, password, now);
-    todo!("task 10")
+    let session = match auth::login(dir, user, password, now) {
+        Ok(session) => session,
+        Err(error) => {
+            log_login_failure(log, user, &error);
+            return Err(error);
+        }
+    };
+    let check = start_log_session(log, &session).map_err(LoginError::Storage)?;
+    // logged after the check, so this line is the first one the new seal covers
+    log.log(Some(user), Event::UnlockSucceeded);
+    Ok(LoggedIn { session, check })
 }
 
+// the only way a session should end: the seal stops following the log, so events after this (someone else's failed logins included) count as "since your last session" next time. dropping the session then releases the vault lock
+pub fn logout(log: &Logger, logged_in: LoggedIn) {
+    log.end_session();
+    drop(logged_in);
+}
+
+// checks the log against the user's seal and starts sealing. the first time, the vault is marked, so a deleted seal can't pass for a first login later
+fn start_log_session(log: &Logger, session: &Session) -> Result<LogCheck, StorageError> {
+    let mut vault = load_logged(log, session)?;
+    let check = log.begin_session(session, vault.log_sealed());
+    if !vault.log_sealed() {
+        vault.mark_log_sealed();
+        if let Err(e) = storage::save(session, &vault) {
+            log_storage_failure(log, Some(session.user()), &e);
+            return Err(e);
+        }
+    }
+    Ok(check)
+}
+
+fn load_logged(log: &Logger, session: &Session) -> Result<Vault, StorageError> {
+    storage::load(session).inspect_err(|e| log_storage_failure(log, Some(session.user()), e))
+}
+
+// unknown users are logged without a name: the typed name could be a mistyped password
+fn log_login_failure(log: &Logger, user: &Username, error: &LoginError) {
+    match error {
+        LoginError::Locked { remaining_secs } => log.log(
+            Some(user),
+            Event::UnlockRefusedLocked {
+                remaining_secs: *remaining_secs,
+            },
+        ),
+        LoginError::BadCredentials {
+            known_user: false, ..
+        } => log.log(None, Event::UnlockFailed(UnlockFailure::UnknownUser)),
+        LoginError::BadCredentials {
+            known_user: true,
+            failure,
+        } => {
+            // no count when the attempts file couldn't be written
+            let failures = failure.as_ref().map_or(0, |f| f.failures);
+            log.log(
+                Some(user),
+                Event::UnlockFailed(UnlockFailure::BadCredentials { failures }),
+            );
+            if let Some(locked_secs) = failure.as_ref().and_then(|f| f.locked_secs) {
+                log.log(Some(user), Event::LockoutStarted { locked_secs });
+            }
+        }
+        LoginError::Storage(StorageError::AlreadyOpen) => {
+            log.log(Some(user), Event::SessionAlreadyOpen);
+        }
+        LoginError::Storage(e) => log_storage_failure(log, Some(user), e),
+    }
+}
+
+
 pub fn list(session: &Session, log: &Logger) -> Result<Vec<Listed>, OpError> {
-    let _ = (session, log);
-    todo!("task 10")
+    let result = storage::load(session).map_err(OpError::from).map(|vault| {
+        vault
+            .credentials()
+            .iter()
+            .map(|c| Listed {
+                service: c.service.clone(),
+                username: c.username.clone(),
+            })
+            .collect()
+    });
+    finish(session, log, result, Event::CredentialsListed)
 }
 
 pub fn add(
@@ -84,10 +185,17 @@ pub fn add(
     log: &Logger,
     service: &str,
     username: &str,
-    password: Zeroizing<String>,
+    mut password: Zeroizing<String>,
 ) -> Result<(), OpError> {
-    let _ = (session, log, service, username, password);
-    todo!("task 10")
+    let result = modify(session, |vault| {
+        vault.add(Credential {
+            service: service.to_string(),
+            username: username.to_string(),
+            // moved, not copied; the credential wipes it when the vault is dropped
+            password: std::mem::take(&mut *password),
+        })
+    });
+    finish(session, log, result, Event::CredentialAdded)
 }
 
 pub fn update_username(
@@ -96,8 +204,11 @@ pub fn update_username(
     service: &str,
     new: &str,
 ) -> Result<(), OpError> {
-    let _ = (session, log, service, new);
-    todo!("task 10")
+    let result = modify(session, |vault| vault.update_username(service, new));
+    let event = Event::CredentialUpdated {
+        field: Field::Username,
+    };
+    finish(session, log, result, event)
 }
 
 pub fn update_password(
@@ -106,13 +217,16 @@ pub fn update_password(
     service: &str,
     new: Zeroizing<String>,
 ) -> Result<(), OpError> {
-    let _ = (session, log, service, new);
-    todo!("task 10")
+    let result = modify(session, |vault| vault.update_password(service, new));
+    let event = Event::CredentialUpdated {
+        field: Field::Password,
+    };
+    finish(session, log, result, event)
 }
 
 pub fn delete(session: &Session, log: &Logger, service: &str) -> Result<(), OpError> {
-    let _ = (session, log, service);
-    todo!("task 10")
+    let result = modify(session, |vault| vault.remove(service));
+    finish(session, log, result, Event::CredentialDeleted)
 }
 
 pub fn copy_password<B: ClipboardBackend>(
@@ -121,8 +235,73 @@ pub fn copy_password<B: ClipboardBackend>(
     clipboard: Option<&ClipboardManager<B>>,
     service: &str,
 ) -> Result<(), OpError> {
-    let _ = (session, log, clipboard, service);
-    todo!("task 10")
+    let result = (|| {
+        let vault = storage::load(session)?;
+        let credential = vault.get(service).ok_or(VaultError::NotFound)?;
+        // never printed instead: without a clipboard the copy simply fails
+        let clipboard = clipboard.ok_or(OpError::ClipboardUnavailable)?;
+        clipboard
+            .copy(&credential.password)
+            .map_err(|_| OpError::ClipboardUnavailable)
+    })();
+    finish(session, log, result, Event::PasswordCopied)
+}
+
+fn modify(
+    session: &Session,
+    act: impl FnOnce(&mut Vault) -> Result<(), VaultError>,
+) -> Result<(), OpError> {
+    let mut vault = storage::load(session)?;
+    act(&mut vault)?;
+    storage::save(session, &vault)?;
+    Ok(())
+}
+
+// success logs the operation's event; a failure logs at most one event saying what went wrong
+fn finish<T>(
+    session: &Session,
+    log: &Logger,
+    result: Result<T, OpError>,
+    success: Event,
+) -> Result<T, OpError> {
+    let user = Some(session.user());
+    match &result {
+        Ok(_) => log.log(user, success),
+        Err(error) => {
+            if let Some(event) = failure_event(error) {
+                log.log(user, event);
+            }
+        }
+    }
+    result
+}
+
+// a missing or duplicate service, or a vault too big to save, is an ordinary mistake: no event
+fn failure_event(error: &OpError) -> Option<Event> {
+    match error {
+        OpError::Storage(e) => storage_event(e),
+        OpError::Vault(VaultError::Invalid(v)) => {
+            Some(Event::ValidationRejected { field: v.field })
+        }
+        OpError::Vault(_) => None,
+        OpError::ClipboardUnavailable => Some(Event::ClipboardUnavailable),
+    }
+}
+
+fn storage_event(error: &StorageError) -> Option<Event> {
+    match error {
+        StorageError::AccessDenied(check) => Some(Event::AccessDenied { check: *check }),
+        StorageError::Unlock => Some(Event::IntegrityCheckFailed),
+        // the kind only: an io error's own message can contain a path
+        StorageError::Io(e) => Some(Event::IoError { kind: e.kind() }),
+        _ => None,
+    }
+}
+
+fn log_storage_failure(log: &Logger, user: Option<&Username>, error: &StorageError) {
+    if let Some(event) = storage_event(error) {
+        log.log(user, event);
+    }
 }
 
 #[cfg(test)]
@@ -515,7 +694,7 @@ mod tests {
     fn login_logs_each_outcome() {
         let (_dir, data) = data_dir();
         let log = Logger::open(&data, clock);
-        drop(create(&data, &log, "alice", PW));
+        logout(&log, create(&data, &log, "alice", PW));
 
         login_error(&data, &log, "alice", "wrong one", NOW);
         login_error(&data, &log, "nobody", PW, NOW);
@@ -595,7 +774,7 @@ mod tests {
         let log = Logger::open(&data, clock);
         let fake = Fake::default();
 
-        drop(create(&data, &log, "alice", MASTER));
+        logout(&log, create(&data, &log, "alice", MASTER));
         login_error(&data, &log, "alice", WRONG, NOW);
         login_error(&data, &log, UNKNOWN, MASTER, NOW);
         login_error(&data, &log, UNKNOWN, WRONG, NOW);
