@@ -14,5 +14,9 @@ rand = "0.10"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+unicode-normalization = "0.1.26"
 zeroize = { version = "1.9", features = ["derive"] }
 
+# geteuid without unsafe code; only needed for the unix access checks
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process", "fs"] }

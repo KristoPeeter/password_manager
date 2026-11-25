@@ -1,0 +1,13 @@
+{
+  "header": {
+    "version": 2,
+    "kdf": {
+      "m_cost": 8192,
+      "t_cost": 1,
+      "p_cost": 1
+    },
+    "salt": "Br0iqjfidgOc85J9hHmZyg==",
+    "nonce": "Hv0pwGn3HAv5AuYK"
+  },
+  "ciphertext": "oW/WnzPTfuc3ZsAmUFiv9gAWlWIGbzYfIBvNCQn5m/oxnbhNdNdlpC6hIfqD7uzEJI8du5JsX34BRMJCgD38npDFAjQXJhV9bPXzlBaNnKfUWvpMCq0k5V2m09mDMg=="
+}

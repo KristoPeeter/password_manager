@@ -213,15 +213,14 @@ mod tests {
         let folder = Path::new("/base/users/alice");
 
         assert_eq!(data.user_dir(&user), folder);
-        for file in [
-            data.vault_file(&user),
-            data.attempts_file(&user),
-            data.lock_file(&user),
-            data.seal_file(&user),
-        ] {
-            assert_eq!(file.parent(), Some(folder), "{file:?} outside user folder");
+        for file in UserFile::ALL {
+            let path = data.user_file(&user, file);
+            assert_eq!(path.parent(), Some(folder), "{file:?} outside user folder");
         }
-        assert_eq!(data.vault_file(&user), folder.join("vault.json"));
+        assert_eq!(
+            data.user_file(&user, UserFile::Vault),
+            folder.join("vault.json")
+        );
     }
 
     // the shared log lives in the base folder, not inside any one user's folder
@@ -276,6 +275,50 @@ mod tests {
             assert!(meta.is_dir(), "{folder:?} missing");
             assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{folder:?}");
         }
+    }
+
+    // an existing data folder others can get into is refused, not quietly kept or fixed:
+    // SECUREVAULT_HOME may point at a folder someone else prepared
+    #[cfg(unix)]
+    #[test]
+    fn ensure_refuses_loose_existing_folders() {
+        use std::os::unix::fs::PermissionsExt;
+        for folder in ["", "users"] {
+            for mode in [0o755, 0o775, 0o777] {
+                let dir = tempfile::tempdir().unwrap();
+                let data = DataDir::at(dir.path().join("securevault"));
+                data.ensure().unwrap();
+                let path = base(&data).join(folder);
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+                assert!(data.ensure().is_err(), "{folder:?} {mode:o} accepted");
+                let now = std::fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(now & 0o777, mode, "{folder:?} {mode:o} was changed");
+            }
+        }
+    }
+
+    // a symlinked data folder or users/ could be repointed later, so it is refused even when
+    // today's target looks fine
+    #[cfg(unix)]
+    #[test]
+    fn ensure_refuses_symlinked_folders() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = DataDir::at(dir.path().join("real"));
+        real.ensure().unwrap();
+
+        // the data folder is a link
+        let link = dir.path().join("link");
+        symlink(base(&real), &link).unwrap();
+        assert!(DataDir::at(link).ensure().is_err(), "symlinked base accepted");
+
+        // users/ is a link
+        let data = DataDir::at(dir.path().join("securevault"));
+        data.ensure().unwrap();
+        std::fs::remove_dir(base(&data).join("users")).unwrap();
+        symlink(base(&real).join("users"), base(&data).join("users")).unwrap();
+        assert!(data.ensure().is_err(), "symlinked users/ accepted");
     }
 
     // running ensure on every start must not fail once the folders exist

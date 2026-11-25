@@ -194,6 +194,8 @@ fn write_atomically(path: &Path, bytes: &[u8], overwrite: bool) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::{DataDir, UserFile, Username};
+    use crate::vault::access::AccessCheck;
     use crate::vault::crypto::KdfParams;
     use crate::vault::models::{Credential, Vault};
     use std::fs;
@@ -201,10 +203,24 @@ mod tests {
 
     const PW: &str = "correct horse battery";
 
-    fn new_vault(dir: &tempfile::TempDir) -> (PathBuf, SessionKey) {
-        let path = dir.path().join("vault.json");
-        let session = create_with_params(&path, PW, KdfParams::TEST).unwrap();
-        (path, session)
+    // a fresh data folder per test; the TempDir must stay alive as long as the DataDir is used
+    fn data_dir() -> (tempfile::TempDir, DataDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::at(dir.path().join("securevault"));
+        data.ensure().unwrap();
+        (dir, data)
+    }
+
+    fn user(name: &str) -> Username {
+        Username::parse(name).unwrap()
+    }
+
+    fn new_user(data: &DataDir, name: &str) -> Session {
+        create_user_with_params(data, &user(name), PW, KdfParams::TEST).unwrap()
+    }
+
+    fn vault_path(data: &DataDir, name: &str) -> PathBuf {
+        data.user_file(&user(name), UserFile::Vault)
     }
 
     fn vault_with_github() -> Vault {
@@ -223,6 +239,7 @@ mod tests {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     }
 
+    // rewrites the vault in place, so it keeps its 0600 mode and only the content changes
     fn tamper(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
         let mut json = read_json(path);
         edit(&mut json);
@@ -235,314 +252,27 @@ mod tests {
         json["ciphertext"] = B64.encode(bytes).into();
     }
 
-    fn assert_unlock_fails_and_file_untouched(path: &Path) {
-        let before = fs::read(path).unwrap();
-        assert!(matches!(unlock(path, PW), Err(StorageError::Unlock)));
-        assert_eq!(fs::read(path).unwrap(), before);
+    // creates alice, closes her session, applies the edit and checks unlock refuses the result
+    fn assert_tamper_is_refused(edit: impl FnOnce(&mut serde_json::Value)) {
+        let (_dir, data) = data_dir();
+        drop(new_user(&data, "alice"));
+        let path = vault_path(&data, "alice");
+        tamper(&path, edit);
+        assert_unlock_fails_and_file_untouched(&data, "alice");
     }
 
-    // a brand new vault unlocks and has nothing in it
-    #[test]
-    fn create_then_unlock_gives_empty_vault() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-
-        let session = unlock(&path, PW).unwrap();
-
-        assert!(load(&path, &session).unwrap().is_empty());
-    }
-
-    // what we save is exactly what we get back after unlocking again
-    #[test]
-    fn save_then_load_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, session) = new_vault(&dir);
-        save(&path, &vault_with_github(), &session).unwrap();
-
-        let reopened = unlock(&path, PW).unwrap();
-
-        assert_eq!(load(&path, &reopened).unwrap(), vault_with_github());
-    }
-
-    // wrong password is rejected and the file stays as it was
-    #[test]
-    fn wrong_password_fails_and_file_untouched() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
+    fn assert_unlock_fails_and_file_untouched(data: &DataDir, name: &str) {
+        let path = vault_path(data, name);
         let before = fs::read(&path).unwrap();
-
         assert!(matches!(
-            unlock(&path, "wrong password"),
+            unlock(data, &user(name), PW),
             Err(StorageError::Unlock)
         ));
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 
-    // password is used as typed, spaces and special letters are not trimmed or changed
-    #[test]
-    fn unicode_and_spaces_password_round_trips_exactly() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.json");
-        create_with_params(&path, " pässwörd ü ", KdfParams::TEST).unwrap();
-
-        assert!(unlock(&path, " pässwörd ü ").is_ok());
-        assert!(matches!(
-            unlock(&path, "pässwörd ü"),
-            Err(StorageError::Unlock)
-        ));
-    }
-
-    // no file means no vault, so the ui knows to create one
-    #[test]
-    fn unlock_missing_file_is_not_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.json");
-
-        assert!(matches!(unlock(&path, PW), Err(StorageError::NotFound)));
-    }
-
-    // creating a vault never overwrites one that already exists
-    #[test]
-    fn create_refuses_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-
-        let result = create_with_params(&path, "another password", KdfParams::TEST);
-
-        assert!(
-            matches!(result, Err(StorageError::Io(ref e)) if e.kind() == io::ErrorKind::AlreadyExists)
-        );
-        assert!(unlock(&path, PW).is_ok());
-    }
-
-    // nothing readable from the vault ends up in the file
-    #[test]
-    fn file_contains_no_plaintext() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, session) = new_vault(&dir);
-        save(&path, &vault_with_github(), &session).unwrap();
-
-        let contents = fs::read_to_string(&path).unwrap();
-
-        for secret in ["github", "alice", "hunter2"] {
-            assert!(!contents.contains(secret), "file leaks {secret:?}");
-        }
-    }
-
-    // every save uses a new nonce, reusing one would break the encryption
-    #[test]
-    fn nonce_and_ciphertext_change_on_every_save() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, session) = new_vault(&dir);
-
-        save(&path, &vault_with_github(), &session).unwrap();
-        let first = read_json(&path);
-        save(&path, &vault_with_github(), &session).unwrap();
-        let second = read_json(&path);
-
-        assert_ne!(first["header"]["nonce"], second["header"]["nonce"]);
-        assert_ne!(first["ciphertext"], second["ciphertext"]);
-    }
-
-    // changing the encrypted data is detected
-    #[test]
-    fn tampered_ciphertext_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-
-        tamper(&path, flip_first_ciphertext_byte);
-
-        assert_unlock_fails_and_file_untouched(&path);
-    }
-
-    // changing the salt is detected
-    #[test]
-    fn tampered_salt_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-
-        tamper(&path, |json| {
-            let salt = B64
-                .decode(json["header"]["salt"].as_str().unwrap())
-                .unwrap();
-            let other: Vec<u8> = salt.iter().map(|b| b ^ 0xFF).collect();
-            json["header"]["salt"] = B64.encode(other).into();
-        });
-
-        assert_unlock_fails_and_file_untouched(&path);
-    }
-
-    // changing the nonce is detected
-    #[test]
-    fn tampered_nonce_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-
-        tamper(&path, |json| {
-            let nonce = B64
-                .decode(json["header"]["nonce"].as_str().unwrap())
-                .unwrap();
-            let other: Vec<u8> = nonce.iter().map(|b| b ^ 0xFF).collect();
-            json["header"]["nonce"] = B64.encode(other).into();
-        });
-
-        assert_unlock_fails_and_file_untouched(&path);
-    }
-
-    // changing the argon2 settings is detected
-    #[test]
-    fn tampered_kdf_param_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-
-        tamper(&path, |json| json["header"]["kdf"]["t_cost"] = 2.into());
-
-        assert_unlock_fails_and_file_untouched(&path);
-    }
-
-    // huge argon2 settings are rejected before they can freeze the app
-    #[test]
-    fn out_of_bounds_kdf_param_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-
-        tamper(&path, |json| {
-            json["header"]["kdf"]["m_cost"] = 4_000_000_000u64.into()
-        });
-
-        assert_unlock_fails_and_file_untouched(&path);
-    }
-
-    // a file version we don't know is rejected
-    #[test]
-    fn wrong_version_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-
-        tamper(&path, |json| json["header"]["version"] = 2.into());
-
-        assert_unlock_fails_and_file_untouched(&path);
-    }
-
-    // extra fields in the file are rejected
-    #[test]
-    fn unknown_field_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-
-        tamper(&path, |json| json["header"]["extra"] = "x".into());
-        assert_unlock_fails_and_file_untouched(&path);
-
-        tamper(&path, |json| {
-            json["header"].as_object_mut().unwrap().remove("extra");
-            json["extra"] = "x".into();
-        });
-        assert_unlock_fails_and_file_untouched(&path);
-    }
-
-    // garbage instead of base64 gives an error, not a crash
-    #[test]
-    fn bad_base64_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-
-        tamper(&path, |json| json["ciphertext"] = "!!!not base64".into());
-
-        assert_unlock_fails_and_file_untouched(&path);
-    }
-
-    // a salt of the wrong size gives an error, not a crash
-    #[test]
-    fn wrong_salt_length_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-
-        tamper(&path, |json| {
-            json["header"]["salt"] = B64.encode([1u8; 15]).into()
-        });
-
-        assert_unlock_fails_and_file_untouched(&path);
-    }
-
-    // ciphertext too short to be real gives an error, not a crash
-    #[test]
-    fn unlock_short_ciphertext_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-
-        tamper(&path, |json| {
-            json["ciphertext"] = B64.encode([1u8; 4]).into()
-        });
-
-        assert_unlock_fails_and_file_untouched(&path);
-    }
-
-    // an empty file gives an error, not a crash
-    #[test]
-    fn unlock_empty_file_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.json");
-        fs::write(&path, "").unwrap();
-
-        assert_unlock_fails_and_file_untouched(&path);
-    }
-
-    // an old unencrypted vault from slice 1 is not accepted
-    #[test]
-    fn unlock_plaintext_slice1_file_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.json");
-        fs::write(
-            &path,
-            r#"{"credentials":[{"username":"a","password":"b","service":"c"}]}"#,
-        )
-        .unwrap();
-
-        assert_unlock_fails_and_file_untouched(&path);
-    }
-
-    // tampering is caught even after the vault was already unlocked
-    #[test]
-    fn load_with_session_after_tamper_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-        let session = unlock(&path, PW).unwrap();
-
-        tamper(&path, flip_first_ciphertext_byte);
-
-        assert!(matches!(load(&path, &session), Err(StorageError::Unlock)));
-    }
-
-    // only the owner can read or write a new vault file
-    #[cfg(unix)]
-    #[test]
-    fn create_sets_mode_0600() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-
-        let mode = fs::metadata(&path).unwrap().permissions().mode();
-
-        assert_eq!(mode & 0o777, 0o600);
-    }
-
-    // saving puts the owner-only permissions back if someone loosened them
-    #[cfg(unix)]
-    #[test]
-    fn save_restores_mode_0600() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let (path, session) = new_vault(&dir);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-
-        save(&path, &vault_with_github(), &session).unwrap();
-
-        let mode = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-    }
-
-    fn file_names(dir: &tempfile::TempDir) -> Vec<String> {
-        let mut names: Vec<String> = fs::read_dir(dir.path())
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
@@ -550,99 +280,507 @@ mod tests {
         names
     }
 
+    fn access_denied(result: Result<impl Sized, StorageError>) -> Option<AccessCheck> {
+        match result {
+            Err(StorageError::AccessDenied(check)) => Some(check),
+            _ => None,
+        }
+    }
+
+    // --- create and unlock ---
+
+    // a brand new vault unlocks and has nothing in it
+    #[test]
+    fn create_then_unlock_gives_empty_vault() {
+        let (_dir, data) = data_dir();
+        drop(new_user(&data, "alice"));
+
+        let session = unlock(&data, &user("alice"), PW).unwrap();
+
+        assert!(load(&session).unwrap().is_empty());
+        assert_eq!(session.user().as_str(), "alice");
+    }
+
+    // what we save is exactly what we get back after unlocking again
+    #[test]
+    fn save_then_load_round_trips() {
+        let (_dir, data) = data_dir();
+        let session = new_user(&data, "alice");
+        save(&session, &vault_with_github()).unwrap();
+        drop(session);
+
+        let reopened = unlock(&data, &user("alice"), PW).unwrap();
+
+        assert_eq!(load(&reopened).unwrap(), vault_with_github());
+    }
+
+    // wrong password is rejected and the file stays as it was
+    #[test]
+    fn wrong_password_fails_and_file_untouched() {
+        let (_dir, data) = data_dir();
+        drop(new_user(&data, "alice"));
+        let path = vault_path(&data, "alice");
+        let before = fs::read(&path).unwrap();
+
+        assert!(matches!(
+            unlock(&data, &user("alice"), "wrong password"),
+            Err(StorageError::Unlock)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    // spaces are part of the password and are never trimmed
+    #[test]
+    fn password_spaces_are_kept() {
+        let (_dir, data) = data_dir();
+        drop(
+            create_user_with_params(&data, &user("alice"), " pässwörd ü ", KdfParams::TEST)
+                .unwrap(),
+        );
+
+        assert!(matches!(
+            unlock(&data, &user("alice"), "pässwörd ü"),
+            Err(StorageError::Unlock)
+        ));
+        assert!(unlock(&data, &user("alice"), " pässwörd ü ").is_ok());
+    }
+
+    // "ä" typed on a mac keyboard can arrive as "a" + a combining mark; both must open the vault
+    #[test]
+    fn composed_and_decomposed_passwords_are_the_same() {
+        let (_dir, data) = data_dir();
+        let composed = "p\u{e4}ssw\u{f6}rd";
+        let decomposed = "pa\u{308}sswo\u{308}rd";
+        assert_ne!(composed, decomposed);
+        drop(create_user_with_params(&data, &user("alice"), composed, KdfParams::TEST).unwrap());
+
+        assert!(unlock(&data, &user("alice"), decomposed).is_ok());
+    }
+
+    #[test]
+    fn normalize_password_is_nfkc() {
+        assert_eq!(&*crypto::normalize_password("pa\u{308}ss"), "p\u{e4}ss");
+        // nfkc also folds compatibility forms, like the "ﬁ" ligature
+        assert_eq!(&*crypto::normalize_password("\u{fb01}x"), "fix");
+    }
+
+    // an unknown user gives the same error kind a missing vault always gave, and nothing is created
+    #[test]
+    fn unlock_unknown_user_is_not_found_and_creates_nothing() {
+        let (dir, data) = data_dir();
+
+        assert!(matches!(
+            unlock(&data, &user("nobody"), PW),
+            Err(StorageError::NotFound)
+        ));
+        assert!(file_names(&dir.path().join("securevault/users")).is_empty());
+    }
+
+    // creating a user never overwrites one that already exists
+    #[test]
+    fn create_existing_user_is_refused() {
+        let (_dir, data) = data_dir();
+        drop(new_user(&data, "alice"));
+
+        let result =
+            create_user_with_params(&data, &user("alice"), "another password", KdfParams::TEST);
+
+        assert!(matches!(result, Err(StorageError::UserExists)));
+        assert!(unlock(&data, &user("alice"), PW).is_ok());
+    }
+
+    // the user folder is private and the vault is owner-only from the first moment
+    #[cfg(unix)]
+    #[test]
+    fn create_user_makes_owner_only_layout() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, data) = data_dir();
+        let _session = new_user(&data, "alice");
+        let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(mode(data.user_dir(&user("alice"))), 0o700);
+        assert_eq!(mode(vault_path(&data, "alice")), 0o600);
+        assert_eq!(mode(data.user_file(&user("alice"), UserFile::Lock)), 0o600);
+    }
+
+    // a session is bound to one user: load and save take no path, so alice can't touch bob's vault
+    #[test]
+    fn session_cannot_reach_another_user() {
+        let (_dir, data) = data_dir();
+        let alice = new_user(&data, "alice");
+        let bob = new_user(&data, "bob");
+
+        save(&alice, &vault_with_github()).unwrap();
+
+        assert!(load(&bob).unwrap().is_empty());
+        assert_eq!(load(&alice).unwrap(), vault_with_github());
+    }
+
+    // two sessions for one user would overwrite each other's changes
+    #[test]
+    fn second_session_is_refused_until_first_drops() {
+        let (_dir, data) = data_dir();
+        let first = new_user(&data, "alice");
+
+        assert!(matches!(
+            unlock(&data, &user("alice"), PW),
+            Err(StorageError::AlreadyOpen)
+        ));
+
+        drop(first);
+        assert!(unlock(&data, &user("alice"), PW).is_ok());
+    }
+
+    // --- access checks ---
+
+    // a vault others can read is refused and left as it is, not quietly fixed
+    #[cfg(unix)]
+    #[test]
+    fn group_readable_vault_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, data) = data_dir();
+        let session = new_user(&data, "alice");
+        let path = vault_path(&data, "alice");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(access_denied(load(&session)), Some(AccessCheck::Mode));
+        assert_eq!(
+            access_denied(save(&session, &vault_with_github())),
+            Some(AccessCheck::Mode)
+        );
+        drop(session);
+        assert_eq!(
+            access_denied(unlock(&data, &user("alice"), PW)),
+            Some(AccessCheck::Mode)
+        );
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
+    }
+
+    // a user folder others can enter is refused too
+    #[cfg(unix)]
+    #[test]
+    fn group_readable_user_dir_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, data) = data_dir();
+        drop(new_user(&data, "alice"));
+        let folder = data.user_dir(&user("alice"));
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o750)).unwrap();
+
+        assert_eq!(
+            access_denied(unlock(&data, &user("alice"), PW)),
+            Some(AccessCheck::Mode)
+        );
+    }
+
+    // a symlink in place of the vault or the user folder could point anywhere; nothing is
+    // read through it or written through it
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_vault_or_user_dir_is_refused() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (dir, data) = data_dir();
+
+        // the vault replaced by a link to some other file
+        let session = new_user(&data, "alice");
+        let path = vault_path(&data, "alice");
+        let victim = dir.path().join("victim.txt");
+        fs::write(&victim, "victim data").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_file(&path).unwrap();
+        symlink(&victim, &path).unwrap();
+
+        assert_eq!(
+            access_denied(save(&session, &vault_with_github())),
+            Some(AccessCheck::Symlink)
+        );
+        assert_eq!(access_denied(load(&session)), Some(AccessCheck::Symlink));
+        drop(session);
+        assert_eq!(
+            access_denied(unlock(&data, &user("alice"), PW)),
+            Some(AccessCheck::Symlink)
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "victim data");
+
+        // bob's folder replaced by a link to alice's
+        drop(new_user(&data, "bob"));
+        let bob_dir = data.user_dir(&user("bob"));
+        fs::remove_dir_all(&bob_dir).unwrap();
+        symlink(data.user_dir(&user("alice")), &bob_dir).unwrap();
+
+        assert_eq!(
+            access_denied(unlock(&data, &user("bob"), PW)),
+            Some(AccessCheck::Symlink)
+        );
+    }
+
+    // opening a fifo blocks until a writer shows up, so the type check has to come first
+    #[cfg(unix)]
+    #[test]
+    fn named_pipe_at_vault_path_fails_fast() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (dir, data) = data_dir();
+        drop(new_user(&data, "alice"));
+        let path = vault_path(&data, "alice");
+        fs::remove_file(&path).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let (tx, rx) = mpsc::channel();
+        let base = dir.path().join("securevault");
+        std::thread::spawn(move || {
+            let data = DataDir::at(base);
+            let _ = tx.send(unlock(&data, &user("alice"), PW).is_err());
+        });
+
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(failed) => assert!(failed, "unlock of a fifo must fail"),
+            Err(_) => {
+                // release the blocked reader so the thread doesn't hang around
+                let _ = fs::OpenOptions::new().write(true).open(&path);
+                panic!("unlock blocked on a named pipe");
+            }
+        }
+    }
+
+    // --- file contents ---
+
+    // nothing readable from the vault ends up in the file
+    #[test]
+    fn file_contains_no_plaintext() {
+        let (_dir, data) = data_dir();
+        let session = new_user(&data, "alice");
+        save(&session, &vault_with_github()).unwrap();
+
+        let contents = fs::read_to_string(vault_path(&data, "alice")).unwrap();
+
+        for secret in ["github", "hunter2"] {
+            assert!(!contents.contains(secret), "file leaks {secret:?}");
+        }
+    }
+
+    // every save uses a new nonce, reusing one would break the encryption
+    #[test]
+    fn nonce_and_ciphertext_change_on_every_save() {
+        let (_dir, data) = data_dir();
+        let session = new_user(&data, "alice");
+        let path = vault_path(&data, "alice");
+
+        save(&session, &vault_with_github()).unwrap();
+        let first = read_json(&path);
+        save(&session, &vault_with_github()).unwrap();
+        let second = read_json(&path);
+
+        assert_ne!(first["header"]["nonce"], second["header"]["nonce"]);
+        assert_ne!(first["ciphertext"], second["ciphertext"]);
+    }
+
+    // a file written by this version is marked as version 2
+    #[test]
+    fn new_vault_is_version_2() {
+        let (_dir, data) = data_dir();
+        drop(new_user(&data, "alice"));
+
+        assert_eq!(
+            read_json(&vault_path(&data, "alice"))["header"]["version"],
+            2
+        );
+    }
+
+    // --- tampering and malformed files ---
+
+    #[test]
+    fn tampered_ciphertext_fails() {
+        assert_tamper_is_refused(flip_first_ciphertext_byte);
+    }
+
+    #[test]
+    fn tampered_salt_fails() {
+        assert_tamper_is_refused(|json| {
+            let salt = B64
+                .decode(json["header"]["salt"].as_str().unwrap())
+                .unwrap();
+            let other: Vec<u8> = salt.iter().map(|b| b ^ 0xFF).collect();
+            json["header"]["salt"] = B64.encode(other).into();
+        });
+    }
+
+    #[test]
+    fn tampered_nonce_fails() {
+        assert_tamper_is_refused(|json| {
+            let nonce = B64
+                .decode(json["header"]["nonce"].as_str().unwrap())
+                .unwrap();
+            let other: Vec<u8> = nonce.iter().map(|b| b ^ 0xFF).collect();
+            json["header"]["nonce"] = B64.encode(other).into();
+        });
+    }
+
+    #[test]
+    fn tampered_kdf_param_fails() {
+        assert_tamper_is_refused(|json| json["header"]["kdf"]["t_cost"] = 2.into());
+    }
+
+    // huge argon2 settings are rejected before they can freeze the app
+    #[test]
+    fn out_of_bounds_kdf_param_fails() {
+        assert_tamper_is_refused(|json| json["header"]["kdf"]["m_cost"] = 4_000_000_000u64.into());
+    }
+
+    // version 1 hashed the password without normalising it, so its key can't be rebuilt; refused
+    #[test]
+    fn version_1_file_is_refused() {
+        assert_tamper_is_refused(|json| json["header"]["version"] = 1.into());
+    }
+
+    #[test]
+    fn unknown_version_is_refused() {
+        assert_tamper_is_refused(|json| json["header"]["version"] = 3.into());
+    }
+
+    #[test]
+    fn unknown_field_in_header_fails() {
+        assert_tamper_is_refused(|json| json["header"]["extra"] = "x".into());
+    }
+
+    #[test]
+    fn unknown_top_level_field_fails() {
+        assert_tamper_is_refused(|json| json["extra"] = "x".into());
+    }
+
+    // garbage instead of base64 gives an error, not a crash
+    #[test]
+    fn bad_base64_fails() {
+        assert_tamper_is_refused(|json| json["ciphertext"] = "!!!not base64".into());
+    }
+
+    #[test]
+    fn wrong_salt_length_fails() {
+        assert_tamper_is_refused(|json| json["header"]["salt"] = B64.encode([1u8; 15]).into());
+    }
+
+    #[test]
+    fn unlock_short_ciphertext_fails() {
+        assert_tamper_is_refused(|json| json["ciphertext"] = B64.encode([1u8; 4]).into());
+    }
+
+    #[test]
+    fn unlock_empty_file_fails() {
+        let (_dir, data) = data_dir();
+        drop(new_user(&data, "alice"));
+        fs::write(vault_path(&data, "alice"), "").unwrap();
+
+        assert_unlock_fails_and_file_untouched(&data, "alice");
+    }
+
+    // an old unencrypted vault from slice 1 is not accepted
+    #[test]
+    fn unlock_plaintext_slice1_file_fails() {
+        let (_dir, data) = data_dir();
+        drop(new_user(&data, "alice"));
+        fs::write(
+            vault_path(&data, "alice"),
+            r#"{"credentials":[{"username":"a","password":"b","service":"c"}]}"#,
+        )
+        .unwrap();
+
+        assert_unlock_fails_and_file_untouched(&data, "alice");
+    }
+
+    // a giant file is rejected instead of being read whole into memory
+    #[test]
+    fn oversized_file_fails() {
+        let (_dir, data) = data_dir();
+        drop(new_user(&data, "alice"));
+        let path = vault_path(&data, "alice");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.resize(MAX_FILE_BYTES as usize + 1, b' ');
+        fs::write(&path, &bytes).unwrap();
+
+        assert_unlock_fails_and_file_untouched(&data, "alice");
+    }
+
+    // tampering is caught even after the vault was already unlocked
+    #[test]
+    fn load_with_session_after_tamper_fails() {
+        let (_dir, data) = data_dir();
+        let session = new_user(&data, "alice");
+
+        tamper(&vault_path(&data, "alice"), flip_first_ciphertext_byte);
+
+        assert!(matches!(load(&session), Err(StorageError::Unlock)));
+    }
+
     // only changing the header (not the key or nonce) must still break decryption, proves the header is aad
     #[test]
     fn header_is_bound_as_aad() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, session) = new_vault(&dir);
-        let mut file: VaultFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert!(decrypt_vault(&file, &session.key).is_ok());
+        let (_dir, data) = data_dir();
+        let session = new_user(&data, "alice");
+        let mut file: VaultFile =
+            serde_json::from_slice(&fs::read(vault_path(&data, "alice")).unwrap()).unwrap();
+        assert!(decrypt_vault(&file, session.key()).is_ok());
 
-        file.header.version = 2;
+        file.header.version = 1;
 
         assert!(matches!(
-            decrypt_vault(&file, &session.key),
+            decrypt_vault(&file, session.key()),
             Err(StorageError::Unlock)
         ));
     }
+
+    // a vault written by this version must keep opening in every later version
+    #[test]
+    fn golden_v2_vault_still_opens() {
+        let (_dir, data) = data_dir();
+        drop(new_user(&data, "alice"));
+        fs::write(vault_path(&data, "alice"), GOLDEN_V2).unwrap();
+
+        let session = unlock(&data, &user("alice"), GOLDEN_PASSWORD).unwrap();
+
+        assert_eq!(load(&session).unwrap(), vault_with_github());
+    }
+
+    const GOLDEN_V2: &str = include_str!("../../tests/fixtures/vault_v2.json");
+    const GOLDEN_PASSWORD: &str = "golden pässwörd";
+
+    // --- saving ---
 
     // a save that fails halfway must leave the old vault exactly as it was
     #[cfg(unix)]
     #[test]
     fn failed_save_keeps_old_vault() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let (path, session) = new_vault(&dir);
-        let before = fs::read(&path).unwrap();
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let (_dir, data) = data_dir();
+        let session = new_user(&data, "alice");
+        let folder = data.user_dir(&user("alice"));
+        let before = fs::read(vault_path(&data, "alice")).unwrap();
+        // read-only folder: the access checks pass (no group or other bits) but writing fails
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o500)).unwrap();
 
-        let result = save(&path, &vault_with_github(), &session);
+        let result = save(&session, &vault_with_github());
 
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(result, Err(StorageError::Io(_))));
-        assert_eq!(fs::read(&path).unwrap(), before);
-        assert!(unlock(&path, PW).is_ok());
+        assert_eq!(fs::read(vault_path(&data, "alice")).unwrap(), before);
+        assert!(load(&session).unwrap().is_empty());
     }
 
     // saving never leaves a temp file lying around
     #[test]
     fn no_tmp_file_left_after_save() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, session) = new_vault(&dir);
+        let (_dir, data) = data_dir();
+        let session = new_user(&data, "alice");
 
-        save(&path, &vault_with_github(), &session).unwrap();
+        save(&session, &vault_with_github()).unwrap();
 
-        assert_eq!(file_names(&dir), vec!["vault.json"]);
-    }
-
-    // creating over an existing vault fails without leaving a temp file behind
-    #[test]
-    fn failed_create_leaves_no_tmp_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-
-        let _ = create_with_params(&path, "another password", KdfParams::TEST);
-
-        assert_eq!(file_names(&dir), vec!["vault.json"]);
-    }
-
-    // if vault.json is swapped for a symlink, save replaces the link and never writes into the file it points to
-    #[cfg(unix)]
-    #[test]
-    fn save_replaces_symlink_instead_of_writing_through_it() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let (path, session) = new_vault(&dir);
-        let victim = dir.path().join("victim.txt");
-        fs::write(&victim, "victim data").unwrap();
-        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
-        fs::remove_file(&path).unwrap();
-        std::os::unix::fs::symlink(&victim, &path).unwrap();
-
-        save(&path, &vault_with_github(), &session).unwrap();
-
-        assert_eq!(fs::read_to_string(&victim).unwrap(), "victim data");
-        let victim_mode = fs::metadata(&victim).unwrap().permissions().mode();
-        assert_eq!(victim_mode & 0o777, 0o644);
-        assert!(
-            !fs::symlink_metadata(&path)
-                .unwrap()
-                .file_type()
-                .is_symlink()
+        assert_eq!(
+            file_names(&data.user_dir(&user("alice"))),
+            vec!["lock", "vault.json"]
         );
-        assert_eq!(load(&path, &session).unwrap(), vault_with_github());
-    }
-
-    // a giant file is rejected instead of being read whole into memory
-    #[test]
-    fn oversized_file_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-        let mut bytes = fs::read(&path).unwrap();
-        bytes.resize(MAX_FILE_BYTES as usize + 1, b' ');
-        fs::write(&path, &bytes).unwrap();
-
-        assert_unlock_fails_and_file_untouched(&path);
     }
 
     // fields are capped (a password is at most 1024 bytes), so a big vault needs many entries.
@@ -663,101 +801,329 @@ mod tests {
     // a vault too big to read back must not be written, or the next unlock would lock the user out
     #[test]
     fn save_refuses_vault_over_size_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, session) = new_vault(&dir);
-        let before = fs::read(&path).unwrap();
+        let (_dir, data) = data_dir();
+        let session = new_user(&data, "alice");
+        let before = fs::read(vault_path(&data, "alice")).unwrap();
 
-        let result = save(
-            &path,
-            &vault_with_entries(8000), // about 11.5 MB on disk
-            &session,
-        );
+        let result = save(&session, &vault_with_entries(8000)); // about 11.5 MB on disk
 
         assert!(matches!(result, Err(StorageError::TooLarge)));
-        assert_eq!(fs::read(&path).unwrap(), before);
-        assert!(unlock(&path, PW).is_ok());
+        assert_eq!(fs::read(vault_path(&data, "alice")).unwrap(), before);
+        assert!(load(&session).is_ok());
     }
 
     // the save limit is not stricter than the read limit: what fits is saved and loads back
     #[test]
     fn anything_saved_can_be_loaded() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, session) = new_vault(&dir);
+        let (_dir, data) = data_dir();
+        let session = new_user(&data, "alice");
         let vault = vault_with_entries(6500); // about 9.3 MB on disk
 
-        save(&path, &vault, &session).unwrap();
+        save(&session, &vault).unwrap();
 
-        assert!(fs::metadata(&path).unwrap().len() <= MAX_FILE_BYTES);
-        assert_eq!(load(&path, &session).unwrap(), vault);
+        assert!(fs::metadata(vault_path(&data, "alice")).unwrap().len() <= MAX_FILE_BYTES);
+        assert_eq!(load(&session).unwrap(), vault);
     }
 
     // saves racing on the same vault must not trip over each other's temp file
     #[test]
     fn concurrent_saves_all_succeed_and_vault_stays_readable() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, session) = new_vault(&dir);
+        let (_dir, data) = data_dir();
+        let session = new_user(&data, "alice");
         let vault = vault_with_github();
 
         let errors: usize = std::thread::scope(|s| {
             let workers: Vec<_> = (0..2)
-                .map(|_| {
-                    s.spawn(|| {
-                        (0..50)
-                            .filter(|_| save(&path, &vault, &session).is_err())
-                            .count()
-                    })
-                })
+                .map(|_| s.spawn(|| (0..50).filter(|_| save(&session, &vault).is_err()).count()))
                 .collect();
             workers.into_iter().map(|w| w.join().unwrap()).sum()
         });
 
         assert_eq!(errors, 0);
-        assert_eq!(load(&path, &session).unwrap(), vault_with_github());
-        assert_eq!(file_names(&dir), vec!["vault.json"]);
+        assert_eq!(load(&session).unwrap(), vault_with_github());
+        assert_eq!(
+            file_names(&data.user_dir(&user("alice"))),
+            vec!["lock", "vault.json"]
+        );
     }
 
-    // opening a fifo blocks until a writer shows up, so unlock must check the file type first
+    // --- review fixes: half-created users ---
+
+    // what a crash (ctrl-c, kill) during create_user leaves today: the user folder, maybe a
+    // temp file from the interrupted write, and no vault
+    fn leave_half_created_user(data: &DataDir, name: &str, with_tmp: bool) -> PathBuf {
+        let folder = data.user_dir(&user(name));
+        fs::create_dir(&folder).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        if with_tmp {
+            let tmp = folder.join(".tmpAbC123");
+            fs::write(&tmp, b"partial write").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        folder
+    }
+
+    // a folder with no vault is not a user: it must not burn password attempts
+    #[test]
+    fn half_created_user_is_unknown_not_a_wrong_password() {
+        let (_dir, data) = data_dir();
+        leave_half_created_user(&data, "alice", false);
+
+        assert!(matches!(
+            unlock(&data, &user("alice"), PW),
+            Err(StorageError::NotFound)
+        ));
+    }
+
+    // a crash during create must not take the name away for good
+    #[test]
+    fn half_created_user_can_be_created_again() {
+        for with_tmp in [false, true] {
+            let (_dir, data) = data_dir();
+            leave_half_created_user(&data, "alice", with_tmp);
+
+            let session = create_user_with_params(&data, &user("alice"), PW, KdfParams::TEST)
+                .unwrap_or_else(|e| panic!("with_tmp={with_tmp}: {e:?}"));
+            save(&session, &vault_with_github()).unwrap();
+            drop(session);
+
+            let session = unlock(&data, &user("alice"), PW).unwrap();
+            assert_eq!(load(&session).unwrap(), vault_with_github());
+        }
+    }
+
+    // reusing a leftover folder is only safe if it is ours and private; one someone else could
+    // have prepared is refused and left alone, not fixed or deleted
     #[cfg(unix)]
     #[test]
-    fn named_pipe_at_vault_path_fails_fast() {
-        use std::sync::mpsc;
-        use std::time::Duration;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.json");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .unwrap();
-        assert!(status.success());
+    fn half_created_folder_with_loose_mode_is_not_reused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, data) = data_dir();
+        let folder = leave_half_created_user(&data, "alice", false);
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let (tx, rx) = mpsc::channel();
-        let fifo = path.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(unlock(&fifo, PW).is_err());
-        });
+        let result = create_user_with_params(&data, &user("alice"), PW, KdfParams::TEST);
 
-        match rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(failed) => assert!(failed, "unlock of a fifo must fail"),
-            Err(_) => {
-                // release the blocked reader so the thread doesn't hang around
-                let _ = fs::OpenOptions::new().write(true).open(&path);
-                panic!("unlock blocked on a named pipe");
+        assert_eq!(access_denied(result), Some(AccessCheck::Mode));
+        let mode = fs::metadata(&folder).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    // --- review fixes: the data folder and users/ are checked too ---
+
+    fn set_mode(path: &Path, mode: u32) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
+    // whoever can write the data folder or users/ can swap the user folder itself, so checking
+    // only the user folder protects nothing
+    #[cfg(unix)]
+    #[test]
+    fn loose_parent_folders_are_refused() {
+        for parent in ["", "users"] {
+            for mode in [0o755, 0o777] {
+                let (dir, data) = data_dir();
+                let folder = dir.path().join("securevault").join(parent);
+                let session = new_user(&data, "alice");
+                set_mode(&folder, mode);
+                let case = format!("{parent:?} {mode:o}");
+
+                assert_eq!(access_denied(load(&session)), Some(AccessCheck::Mode), "{case}");
+                assert_eq!(
+                    access_denied(save(&session, &vault_with_github())),
+                    Some(AccessCheck::Mode),
+                    "{case}"
+                );
+                drop(session);
+                assert_eq!(
+                    access_denied(unlock(&data, &user("alice"), PW)),
+                    Some(AccessCheck::Mode),
+                    "{case}"
+                );
+                assert_eq!(
+                    access_denied(create_user_with_params(
+                        &data,
+                        &user("bob"),
+                        PW,
+                        KdfParams::TEST
+                    )),
+                    Some(AccessCheck::Mode),
+                    "{case}"
+                );
+                // refused, not quietly fixed
+                let now = fs::metadata(&folder).unwrap();
+                assert_eq!(
+                    std::os::unix::fs::PermissionsExt::mode(&now.permissions()) & 0o777,
+                    mode,
+                    "{case}"
+                );
+                set_mode(&folder, 0o700); // so the temp dir can be cleaned up
             }
         }
     }
 
-    // unlocking also fixes loose permissions, not only saving
+    // a symlinked data folder or users/ could be repointed at any time
     #[cfg(unix)]
     #[test]
-    fn unlock_restores_mode_0600() {
-        use std::os::unix::fs::PermissionsExt;
+    fn symlinked_parent_folders_are_refused() {
+        use std::os::unix::fs::symlink;
+
+        // the data folder itself is a link
+        let (dir, real) = data_dir();
+        drop(new_user(&real, "alice"));
+        let link = dir.path().join("link");
+        symlink(dir.path().join("securevault"), &link).unwrap();
+        let linked = DataDir::at(link);
+        assert_eq!(
+            access_denied(unlock(&linked, &user("alice"), PW)),
+            Some(AccessCheck::Symlink)
+        );
+        assert_eq!(
+            access_denied(create_user_with_params(
+                &linked,
+                &user("bob"),
+                PW,
+                KdfParams::TEST
+            )),
+            Some(AccessCheck::Symlink)
+        );
+        assert!(!real.user_dir(&user("bob")).exists());
+
+        // users/ swapped for a link while a session is open
+        let (dir, data) = data_dir();
+        let session = new_user(&data, "alice");
+        let users = dir.path().join("securevault/users");
+        let moved = dir.path().join("securevault/users-real");
+        fs::rename(&users, &moved).unwrap();
+        symlink(&moved, &users).unwrap();
+        assert_eq!(access_denied(load(&session)), Some(AccessCheck::Symlink));
+        assert_eq!(
+            access_denied(save(&session, &vault_with_github())),
+            Some(AccessCheck::Symlink)
+        );
+        drop(session);
+        assert_eq!(
+            access_denied(unlock(&data, &user("alice"), PW)),
+            Some(AccessCheck::Symlink)
+        );
+    }
+
+    // logging in before anyone has created a user is an unknown user, and it creates nothing
+    #[test]
+    fn unlock_with_no_data_folder_is_not_found_and_creates_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, _) = new_vault(&dir);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let data = DataDir::at(dir.path().join("securevault"));
 
-        unlock(&path, PW).unwrap();
+        assert!(matches!(
+            unlock(&data, &user("alice"), PW),
+            Err(StorageError::NotFound)
+        ));
+        assert!(!dir.path().join("securevault").exists());
+    }
 
-        let mode = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+    // --- review fixes: the lock file ---
+
+    // the lock file is opened with create, so a planted link would make the app create or open
+    // a file of the attacker's choosing
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_lock_file_is_refused() {
+        use std::os::unix::fs::symlink;
+        for target_exists in [false, true] {
+            let (dir, data) = data_dir();
+            drop(new_user(&data, "alice"));
+            let lock = data.user_file(&user("alice"), UserFile::Lock);
+            let target = dir.path().join("planted");
+            if target_exists {
+                fs::write(&target, "keep me").unwrap();
+                set_mode(&target, 0o600);
+            }
+            fs::remove_file(&lock).unwrap();
+            symlink(&target, &lock).unwrap();
+
+            assert_eq!(
+                access_denied(unlock(&data, &user("alice"), PW)),
+                Some(AccessCheck::Symlink),
+                "target_exists={target_exists}"
+            );
+            if target_exists {
+                assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+            } else {
+                assert!(!target.exists(), "lock symlink was followed");
+            }
+        }
+    }
+
+    // --- review fixes: NotFound is only "unknown user" during unlock ---
+
+    // a folder that disappears mid-session is a storage problem, not a wrong password
+    #[test]
+    fn vanished_user_folder_mid_session_is_a_storage_error() {
+        let (_dir, data) = data_dir();
+        let session = new_user(&data, "alice");
+        let folder = data.user_dir(&user("alice"));
+        fs::remove_dir_all(&folder).unwrap();
+
+        assert!(matches!(load(&session), Err(StorageError::Io(_))));
+        assert!(matches!(
+            save(&session, &vault_with_github()),
+            Err(StorageError::Io(_))
+        ));
+        assert!(!folder.exists(), "save recreated the folder");
+    }
+
+    // creating a user never shows the unlock message, whatever goes wrong on disk
+    // (/proc refuses new folders with "not found", the case the regression run hit)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_user_never_reports_an_unlock_error() {
+        let data = DataDir::at(PathBuf::from("/proc/self/securevault-test/x"));
+
+        let error = create_user_with_params(&data, &user("alice"), PW, KdfParams::TEST).err();
+
+        assert!(matches!(error, Some(StorageError::Io(_))), "{error:?}");
+    }
+
+    // --- messages ---
+
+    // what reaches the screen is one of the fixed messages: no path, no os error text
+    #[test]
+    fn display_messages_leak_no_internals() {
+        let allowed = [
+            "Could not access vault storage",
+            "Couldn't unlock vault",
+            "Access denied",
+            "Vault is too large to save",
+            "Username is not available",
+            "This vault is already open in another session",
+        ];
+        let errors = [
+            StorageError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "/home/alice/secret: os error 13",
+            )),
+            StorageError::NotFound,
+            StorageError::Unlock,
+            StorageError::AccessDenied(AccessCheck::Owner),
+            StorageError::TooLarge,
+            StorageError::UserExists,
+            StorageError::AlreadyOpen,
+        ];
+        for error in errors {
+            let message = error.to_string();
+            assert!(allowed.contains(&message.as_str()), "{message:?}");
+        }
     }
 }
