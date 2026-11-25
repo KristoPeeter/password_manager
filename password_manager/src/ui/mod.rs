@@ -1,4 +1,4 @@
-mod clipboard;
+pub(crate) mod clipboard;
 
 use std::{fmt, io, process::ExitCode};
 

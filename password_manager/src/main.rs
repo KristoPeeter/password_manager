@@ -3,6 +3,7 @@
 
 use std::process::ExitCode;
 
+mod actions;
 mod audit;
 mod paths;
 mod ui;
