@@ -1,36 +1,62 @@
-use std::{fmt, fs, io, path::Path};
+use std::{
+    fmt,
+    fs::{self, File},
+    io,
+    path::{Path, PathBuf},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use super::access::{self, AccessCheck, AccessError};
 use super::crypto::{self, KdfParams, Key, NONCE_LEN, SALT_LEN};
-
 use super::models::Vault;
+use crate::paths::{DataDir, UserFile, Username};
 use std::io::{Read, Write};
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-const VERSION: u32 = 1;
+// "no such file" only means "no such user" inside unlock; everywhere else it is a storage
+// problem (a folder vanished mid-session, a data folder that can't be created)
+fn missing_means_unknown_user(e: StorageError) -> StorageError {
+    match e {
+        StorageError::Io(ref io) if io.kind() == io::ErrorKind::NotFound => StorageError::NotFound,
+        other => other,
+    }
+}
+
+// 2 marks that the master password is nfkc-normalised before key derivation
+const VERSION: u32 = 2;
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB MAX for file sizes
 
 #[derive(Debug)]
 pub enum StorageError {
+    // the error and the check are kept for the log (task 8); the screen only gets fixed text
+    #[allow(dead_code)]
     Io(io::Error),
     NotFound,
     Unlock,
+    #[allow(dead_code)]
+    AccessDenied(AccessCheck),
     TooLarge,
+    UserExists,
+    AlreadyOpen,
 }
 
 impl fmt::Display for StorageError {
+    // fixed messages only: os error text can contain paths, which go to the log as an error kind
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StorageError::Io(e) => write!(f, "Could not access vault file: {}", e),
-            StorageError::NotFound => write!(f, "No vault found"),
-            StorageError::Unlock => write!(f, "Couldn't unlock vault"),
-            StorageError::TooLarge => write!(f, "Vault is too large to save"),
-        }
+        let message = match self {
+            StorageError::Io(_) => "Could not access vault storage",
+            StorageError::NotFound | StorageError::Unlock => "Couldn't unlock vault",
+            StorageError::AccessDenied(_) => "Access denied",
+            StorageError::TooLarge => "Vault is too large to save",
+            StorageError::UserExists => "Username is not available",
+            StorageError::AlreadyOpen => "This vault is already open in another session",
+        };
+        write!(f, "{message}")
     }
 }
 
@@ -38,18 +64,47 @@ impl std::error::Error for StorageError {}
 
 impl From<io::Error> for StorageError {
     fn from(e: io::Error) -> Self {
-        if e.kind() == io::ErrorKind::NotFound {
-            StorageError::NotFound
-        } else {
-            StorageError::Io(e)
+        StorageError::Io(e)
+    }
+}
+
+impl From<AccessError> for StorageError {
+    fn from(e: AccessError) -> Self {
+        match e {
+            AccessError::Denied(check) => StorageError::AccessDenied(check),
+            AccessError::Io(e) => e.into(),
         }
     }
 }
 
-pub struct SessionKey {
+// an unlocked vault for one user
+pub struct Session {
+    #[allow(dead_code)] // read through user() by the login flow and the log, tasks 7 and 10
+    user: Username,
+    data: DataDir,
+    user_dir: PathBuf,
+    vault: PathBuf,
     key: Key,
     salt: [u8; SALT_LEN],
     params: KdfParams,
+    // held for the whole session; the os releases the lock when the file is closed or the process ends, so a crash never leaves a vault locked
+    _lock: File,
+}
+
+impl Session {
+    #[allow(dead_code)] // tasks 7 and 10
+    pub fn user(&self) -> &Username {
+        &self.user
+    }
+
+    #[allow(dead_code)] // the log seal derives its key from this, task 9
+    pub(crate) fn key(&self) -> &Key {
+        &self.key
+    }
+
+    fn check_access(&self) -> Result<(), StorageError> {
+        check_user_paths(&self.data, &self.user_dir, &self.vault)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -68,6 +123,15 @@ struct VaultFile {
     ciphertext: String,
 }
 
+// outermost folder first: only the owner of a folder can swap what is inside it, so once every
+// folder on the way has passed, the vault can't be replaced between the check and the read.
+fn check_user_paths(dir: &DataDir, user_dir: &Path, vault: &Path) -> Result<(), StorageError> {
+    dir.check_folders()?;
+    access::check_dir(user_dir)?;
+    access::check_file(vault)?;
+    Ok(())
+}
+
 fn decode<const N: usize>(s: &str) -> Result<[u8; N], StorageError> {
     B64.decode(s)
         .ok()
@@ -80,7 +144,7 @@ fn read_file(path: &Path) -> Result<VaultFile, StorageError> {
     if !fs::metadata(path)?.is_file() {
         return Err(io::Error::other("not a regular file").into());
     }
-    let file = fs::File::open(path)?;
+    let file = File::open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("not a regular file").into());
     }
@@ -107,19 +171,23 @@ fn decrypt_vault(file: &VaultFile, key: &Key) -> Result<Vault, StorageError> {
     serde_json::from_slice(&plaintext).map_err(|_| StorageError::Unlock)
 }
 
-fn encrypt_vault(vault: &Vault, session: &SessionKey) -> Result<Vec<u8>, StorageError> {
+fn encrypt_vault(
+    vault: &Vault,
+    key: &Key,
+    salt: &[u8; SALT_LEN],
+    params: KdfParams,
+) -> Result<Vec<u8>, StorageError> {
     // a fresh nonce on every save, reusing one with the same key breaks aes-gcm
     let nonce = crypto::random_bytes::<NONCE_LEN>();
     let header = Header {
         version: VERSION,
-        kdf: session.params,
-        salt: B64.encode(session.salt),
+        kdf: params,
+        salt: B64.encode(salt),
         nonce: B64.encode(nonce),
     };
     let aad = serde_json::to_vec(&header).map_err(|_| StorageError::Unlock)?;
     let plaintext = Zeroizing::new(serde_json::to_vec(vault).map_err(|_| StorageError::Unlock)?);
-    let ciphertext = crypto::encrypt(&session.key, &nonce, &aad, &plaintext)
-        .map_err(|_| StorageError::Unlock)?;
+    let ciphertext = crypto::encrypt(key, &nonce, &aad, &plaintext).map_err(|_| StorageError::Unlock)?;
     let file = VaultFile {
         header,
         ciphertext: B64.encode(ciphertext),
@@ -127,46 +195,164 @@ fn encrypt_vault(vault: &Vault, session: &SessionKey) -> Result<Vec<u8>, Storage
     serde_json::to_vec_pretty(&file).map_err(|_| StorageError::Unlock)
 }
 
-pub fn create(path: &Path, password: &str) -> Result<SessionKey, StorageError> {
-    create_with_params(path, password, KdfParams::DEFAULT)
+fn derive(password: &str, salt: &[u8; SALT_LEN], params: &KdfParams) -> Result<Key, StorageError> {
+    let password = crypto::normalize_password(password);
+    crypto::derive_key(password.as_bytes(), salt, params).map_err(|_| StorageError::Unlock)
 }
-pub(crate) fn create_with_params(
-    path: &Path,
+
+// one lock per user. try_lock fails at once instead of waiting, second session always fails
+fn take_lock(path: &Path) -> Result<File, StorageError> {
+    // open with create would follow a planted link and create or open its target, so an existing lock file gets the same checks as the vault
+    match access::check_file(path) {
+        Ok(()) => {}
+        Err(AccessError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+        // closes the gap between the check and the open: a link planted in between fails here
+        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    }
+    let file = options.open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(StorageError::AlreadyOpen),
+        Err(fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+pub fn create_user(
+    dir: &DataDir,
+    user: &Username,
+    password: &str,
+) -> Result<Session, StorageError> {
+    create_user_with_params(dir, user, password, KdfParams::DEFAULT)
+}
+
+pub(crate) fn create_user_with_params(
+    dir: &DataDir,
+    user: &Username,
     password: &str,
     params: KdfParams,
-) -> Result<SessionKey, StorageError> {
-    let salt = crypto::random_bytes::<SALT_LEN>();
-    let key = crypto::derive_key(password.as_bytes(), &salt, &params)
-        .map_err(|_| StorageError::Unlock)?;
-    let session = SessionKey { key, salt, params };
-    let bytes = encrypt_vault(&Vault::default(), &session)?;
+) -> Result<Session, StorageError> {
+    dir.ensure()?;
+    let user_dir = dir.user_dir(user);
+    let vault = dir.user_file(user, UserFile::Vault);
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    // not recursive: the folder is either made here or examined below, never silently reused
+    let created_dir = match builder.create(&user_dir) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // a crash during an earlier create leaves the folder without a vault. it is only
+            // reused if it passes the same checks as a real user folder
+            access::check_dir(&user_dir)?;
+            match fs::symlink_metadata(&vault) {
+                Ok(_) => return Err(StorageError::UserExists),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
 
-    write_atomically(path, &bytes, false)?;
-    Ok(session)
+    // the lock comes before the vault exists, so no unlock can open a session on a vault that
+    // is still being created, and two creates of the same name can't both proceed
+    let lock = match take_lock(&dir.user_file(user, UserFile::Lock)) {
+        Ok(lock) => lock,
+        Err(StorageError::AlreadyOpen) => return Err(StorageError::UserExists),
+        Err(e) => return Err(e),
+    };
+
+    let result = (|| {
+        let salt = crypto::random_bytes::<SALT_LEN>();
+        let key = derive(password, &salt, &params)?;
+        let bytes = encrypt_vault(&Vault::default(), &key, &salt, params)?;
+        match write_atomically(&vault, &bytes, false) {
+            Err(StorageError::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(StorageError::UserExists);
+            }
+            result => result?,
+        }
+        Ok((key, salt))
+    })();
+
+    match result {
+        Ok((key, salt)) => Ok(Session {
+            user: user.clone(),
+            data: dir.clone(),
+            user_dir,
+            vault,
+            key,
+            salt,
+            params,
+            _lock: lock,
+        }),
+        Err(e) => {
+            // only a folder made by this call is removed, and only while its lock is held, so a
+            // session someone else opened can't be deleted. a leftover folder is harmless now
+            // that create reuses it
+            if created_dir && !matches!(e, StorageError::UserExists) {
+                let _ = fs::remove_dir_all(&user_dir);
+            }
+            drop(lock);
+            Err(e)
+        }
+    }
 }
-pub fn unlock(path: &Path, password: &str) -> Result<SessionKey, StorageError> {
-    let file = read_file(path)?;
+
+pub fn unlock(dir: &DataDir, user: &Username, password: &str) -> Result<Session, StorageError> {
+    let user_dir = dir.user_dir(user);
+    let vault = dir.user_file(user, UserFile::Vault);
+    let file = check_user_paths(dir, &user_dir, &vault)
+        .and_then(|()| read_file(&vault))
+        .map_err(missing_means_unknown_user)?;
     let salt = decode::<SALT_LEN>(&file.header.salt)?;
     let params = file.header.kdf;
-    let key = crypto::derive_key(password.as_bytes(), &salt, &params)
-        .map_err(|_| StorageError::Unlock)?;
+    let key = derive(password, &salt, &params)?;
     decrypt_vault(&file, &key)?;
-    #[cfg(unix)]
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    Ok(SessionKey { key, salt, params })
+
+    // only after the password is proven, so a wrong guess can't tell whether a session is open
+    let lock = take_lock(&dir.user_file(user, UserFile::Lock))?;
+    Ok(Session {
+        user: user.clone(),
+        data: dir.clone(),
+        user_dir,
+        vault,
+        key,
+        salt,
+        params,
+        _lock: lock,
+    })
 }
 
-pub fn save(path: &Path, vault: &Vault, session: &SessionKey) -> Result<(), StorageError> {
-    let bytes = encrypt_vault(vault, session)?;
+// does the same argon2 work as a real unlock and throws it away, so an unknown username
+// takes as long to refuse as a wrong password (used by the login flow, task 7)
+#[allow(dead_code)]
+pub(crate) fn dummy_unlock(password: &str) {
+    let salt = crypto::random_bytes::<SALT_LEN>();
+    let _ = derive(password, &salt, &KdfParams::DEFAULT);
+}
+
+pub fn load(session: &Session) -> Result<Vault, StorageError> {
+    session.check_access()?;
+    decrypt_vault(&read_file(&session.vault)?, &session.key)
+}
+
+pub fn save(session: &Session, vault: &Vault) -> Result<(), StorageError> {
+    session.check_access()?;
+    let bytes = encrypt_vault(vault, &session.key, &session.salt, session.params)?;
     // read_file refuses anything over the limit, so writing it would lock the user out of their vault
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(StorageError::TooLarge);
     }
-    write_atomically(path, &bytes, true)
+    write_atomically(&session.vault, &bytes, true)
 }
-pub fn load(path: &Path, session: &SessionKey) -> Result<Vault, StorageError> {
-    decrypt_vault(&read_file(path)?, &session.key)
-}
+
 // writes a synced temp file and swaps it in
 fn write_atomically(path: &Path, bytes: &[u8], overwrite: bool) -> Result<(), StorageError> {
     // same folder as the target, so the final rename never crosses filesystems

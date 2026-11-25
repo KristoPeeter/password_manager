@@ -4,6 +4,7 @@ use aes_gcm::{
 };
 use argon2::{Algorithm, Argon2, Params, Version};
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
 
 pub const SALT_LEN: usize = 16;
@@ -39,6 +40,11 @@ impl KdfParams {
             && (1..=10).contains(&self.t_cost)
             && (1..=4).contains(&self.p_cost)
     }
+}
+
+// NIST SP 800-63B recommends normalising before hashing. the intermediate buffers of the iterator are not ours to wipe, which is documented as a limitation
+pub fn normalize_password(password: &str) -> Zeroizing<String> {
+    Zeroizing::new(password.nfkc().collect())
 }
 
 #[derive(Debug, PartialEq)]

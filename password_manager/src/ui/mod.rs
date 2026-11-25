@@ -1,6 +1,6 @@
 mod clipboard;
 
-use std::{fmt, io, path::Path, process::ExitCode};
+use std::{fmt, io, process::ExitCode};
 
 use inquire::{
     Confirm, InquireError, Password, PasswordDisplayMode, Select, Text, required,
@@ -10,13 +10,16 @@ use zeroize::Zeroizing;
 
 use clipboard::{CLEAR_AFTER, ClipboardManager};
 
+use crate::paths::{DataDir, UserFile, Username};
 use crate::vault::{
     models::{Credential, Vault, VaultError},
-    storage::{self, SessionKey, StorageError},
+    storage::{self, Session, StorageError},
     validation,
 };
 
-const VAULT_PATH: &str = "vault.json";
+// temporary bridge until the login screen exists (task 7): one fixed user, so the app keeps
+// working on the new per-user storage. task 11 replaces this
+const BRIDGE_USER: &str = "default";
 
 #[derive(Clone, Copy)]
 enum MenuAction {
@@ -100,21 +103,32 @@ impl From<io::Error> for ActionError {
 const UNLOCK_ATTEMPTS: usize = 3;
 
 pub fn run() -> ExitCode {
-    let path = Path::new(VAULT_PATH);
+    let data = match DataDir::resolve() {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Ok(user) = Username::parse(BRIDGE_USER) else {
+        return ExitCode::FAILURE;
+    };
+
 
     // try_exists, not exists: a permission error must not look like "no vault yet"
-    let session = match path.try_exists() {
-        Ok(false) => match create_vault(path) {
-            Some(session) => session,
-            None => return ExitCode::SUCCESS,
-        },
-        Ok(true) => match unlock_vault(path) {
+    let session = match data.user_file(&user, UserFile::Vault).try_exists() {
+        Ok(false) => match create_vault(&data, &user) {
             Ok(Some(session)) => session,
             Ok(None) => return ExitCode::SUCCESS,
             Err(()) => return ExitCode::FAILURE,
         },
-        Err(e) => {
-            eprintln!("Could not access vault file: {e}");
+        Ok(true) => match unlock_vault(&data, &user) {
+            Ok(Some(session)) => session,
+            Ok(None) => return ExitCode::SUCCESS,
+            Err(()) => return ExitCode::FAILURE,
+        },
+        Err(_) => {
+            eprintln!("{}", StorageError::Io(io::ErrorKind::Other.into()));
             return ExitCode::FAILURE;
         }
     };
@@ -129,7 +143,7 @@ pub fn run() -> ExitCode {
     };
 
     loop {
-        let mut vault = match storage::load(path, &session) {
+        let mut vault = match storage::load(&session) {
             Ok(vault) => vault,
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -142,13 +156,13 @@ pub fn run() -> ExitCode {
         };
 
         let result = match action {
-            MenuAction::Add => add(&mut vault, path, &session),
+            MenuAction::Add => add(&mut vault, &session),
             MenuAction::List => {
                 list(&vault);
                 Ok(())
             }
             MenuAction::Copy => copy(&vault, clipboard.as_ref()),
-            MenuAction::Delete => delete(&mut vault, path, &session),
+            MenuAction::Delete => delete(&mut vault, &session),
             MenuAction::Exit => return exit(ExitCode::SUCCESS),
         };
 
@@ -160,7 +174,8 @@ pub fn run() -> ExitCode {
     }
 }
 
-fn create_vault(path: &Path) -> Option<SessionKey> {
+// Ok(None) means the user cancelled, Err(()) means creating failed and the app exits with failure
+fn create_vault(data: &DataDir, user: &Username) -> Result<Option<Session>, ()> {
     println!("No vault found — create one.");
     let password = Password::new("New master password:")
         .with_display_mode(PasswordDisplayMode::Masked)
@@ -174,19 +189,22 @@ fn create_vault(path: &Path) -> Option<SessionKey> {
         })
         .prompt()
         .ok()
-        .map(Zeroizing::new)?;
+        .map(Zeroizing::new);
+    let Some(password) = password else {
+        return Ok(None);
+    };
 
-    match storage::create(path, &password) {
-        Ok(session) => Some(session),
+    match storage::create_user(data, user, &password) {
+        Ok(session) => Ok(Some(session)),
         Err(e) => {
             eprintln!("Error: {}", e);
-            None
+            Err(())
         }
     }
 }
 
 // Ok(None) means the user cancelled, Err(()) means give up and exit with failure
-fn unlock_vault(path: &Path) -> Result<Option<SessionKey>, ()> {
+fn unlock_vault(data: &DataDir, user: &Username) -> Result<Option<Session>, ()> {
     for _ in 0..UNLOCK_ATTEMPTS {
         let Ok(password) = Password::new("Master password:")
             .with_display_mode(PasswordDisplayMode::Masked)
@@ -197,9 +215,9 @@ fn unlock_vault(path: &Path) -> Result<Option<SessionKey>, ()> {
             return Ok(None);
         };
 
-        match storage::unlock(path, &password) {
+        match storage::unlock(data, user, &password) {
             Ok(session) => return Ok(Some(session)),
-            Err(StorageError::Unlock) => eprintln!("Couldn't unlock vault"),
+            Err(e @ (StorageError::Unlock | StorageError::NotFound)) => eprintln!("{e}"),
             Err(e) => {
                 eprintln!("{}", e);
                 return Err(());
@@ -209,7 +227,7 @@ fn unlock_vault(path: &Path) -> Result<Option<SessionKey>, ()> {
     Err(())
 }
 
-fn add(vault: &mut Vault, path: &Path, session: &SessionKey) -> Result<(), ActionError> {
+fn add(vault: &mut Vault, session: &Session) -> Result<(), ActionError> {
     let service = Text::new("Service:")
         .with_validator(required!("Service is required"))
         .prompt()?;
@@ -228,7 +246,7 @@ fn add(vault: &mut Vault, path: &Path, session: &SessionKey) -> Result<(), Actio
         username,
         password,
     })?;
-    storage::save(path, vault, session)?;
+    storage::save(session, vault)?;
     println!("Saved.");
     Ok(())
 }
@@ -265,7 +283,7 @@ fn copy(
     Ok(())
 }
 
-fn delete(vault: &mut Vault, path: &Path, session: &SessionKey) -> Result<(), ActionError> {
+fn delete(vault: &mut Vault, session: &Session) -> Result<(), ActionError> {
     let Some(service) = select_service(vault)? else {
         return Ok(());
     };
@@ -277,7 +295,7 @@ fn delete(vault: &mut Vault, path: &Path, session: &SessionKey) -> Result<(), Ac
     }
 
     vault.remove(&service)?;
-    storage::save(path, vault, session)?;
+    storage::save(session, vault)?;
     println!("Deleted.");
     Ok(())
 }

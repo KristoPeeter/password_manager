@@ -1,6 +1,3 @@
-// nothing uses this module outside its tests until the login flow is wired in (tasks 5 and 7)
-#![allow(dead_code)]
-
 use std::{
     ffi::OsString,
     fmt, fs, io,
@@ -10,13 +7,46 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 
+use crate::vault::access::{self, AccessError};
+
 const MAX_USERNAME_LEN: usize = 32;
 const ENV_OVERRIDE: &str = "SECUREVAULT_HOME";
 const APP_FOLDER: &str = "securevault";
 const USERS_FOLDER: &str = "users";
 
+// the files kept in each user's folder. file names are fixed here, never built from input
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UserFile {
+    Vault,
+    #[allow(dead_code)] // lockout state, task 6
+    Attempts,
+    Lock,
+    #[allow(dead_code)] // log seal, task 9
+    Seal,
+}
+
+impl UserFile {
+    #[cfg(test)]
+    const ALL: [UserFile; 4] = [
+        UserFile::Vault,
+        UserFile::Attempts,
+        UserFile::Lock,
+        UserFile::Seal,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            UserFile::Vault => "vault.json",
+            UserFile::Attempts => "attempts.json",
+            UserFile::Lock => "lock",
+            UserFile::Seal => "log.seal",
+        }
+    }
+}
+
 // the private field means the only way to get a Username is through parse,
 // so every user path is built from a validated name
+#[derive(Debug, Clone, PartialEq)]
 pub struct Username(String);
 
 #[derive(Debug, PartialEq)]
@@ -69,6 +99,7 @@ impl fmt::Display for PathsError {
 
 impl std::error::Error for PathsError {}
 
+#[derive(Clone)]
 pub struct DataDir(PathBuf);
 
 impl DataDir {
@@ -95,13 +126,24 @@ impl DataDir {
         }
     }
 
+    #[cfg(test)]
     pub fn at(base: PathBuf) -> Self {
         Self(base)
     }
 
-    pub fn ensure(&self) -> io::Result<()> {
+    // existing folders are checked, not fixed: a loose or linked one may have been prepared by
+    // someone else, and changing its mode would hide that
+    pub fn ensure(&self) -> Result<(), AccessError> {
         create_private_dir(&self.0)?;
-        create_private_dir(&self.users_dir())
+        create_private_dir(&self.users_dir())?;
+        self.check_folders()
+    }
+
+    // whoever can write the data folder or users/ can swap a user folder, so these are checked
+    // before every vault operation, not only at startup
+    pub fn check_folders(&self) -> Result<(), AccessError> {
+        access::check_dir(&self.0)?;
+        access::check_dir(&self.users_dir())
     }
 
     fn users_dir(&self) -> PathBuf {
@@ -113,26 +155,16 @@ impl DataDir {
         self.users_dir().join(user.as_str())
     }
 
-    pub fn vault_file(&self, user: &Username) -> PathBuf {
-        self.user_dir(user).join("vault.json")
+    pub fn user_file(&self, user: &Username, file: UserFile) -> PathBuf {
+        self.user_dir(user).join(file.name())
     }
 
-    pub fn attempts_file(&self, user: &Username) -> PathBuf {
-        self.user_dir(user).join("attempts.json")
-    }
-
-    pub fn lock_file(&self, user: &Username) -> PathBuf {
-        self.user_dir(user).join("lock")
-    }
-
-    pub fn seal_file(&self, user: &Username) -> PathBuf {
-        self.user_dir(user).join("log.seal")
-    }
-
+    #[allow(dead_code)] // audit log, task 8
     pub fn log_file(&self) -> PathBuf {
         self.0.join("events.log")
     }
 
+    #[allow(dead_code)] // audit log, task 8
     pub fn rotated_log_file(&self) -> PathBuf {
         self.0.join("events.log.1")
     }
