@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::paths::{DataDir, Username};
 use crate::vault::access::{self, AccessCheck, AccessError};
+use crate::vault::storage::Session;
 use crate::vault::validation::Field;
 
 #[cfg(unix)]
@@ -271,6 +272,28 @@ impl Logger {
         file.write_all(out.as_bytes())?;
         drop(lock);
         Ok(())
+    }
+}
+
+// what the log check at login found
+#[derive(Debug, PartialEq)]
+pub enum LogCheck {
+    Clean {
+        failed_attempts_since_last_session: u32,
+    },
+    Tampered(TamperProblem),
+}
+
+impl Logger {
+    // checks the log against this user's seal, then keeps the seal on the newest line for as long as the session lasts. vault_says_sealed comes from the vault, so deleting log.seal can't pass for a first login
+    pub fn begin_session(&self, session: &Session, vault_says_sealed: bool) -> LogCheck {
+        let _ = (session, vault_says_sealed);
+        todo!("task 9")
+    }
+
+    // stops sealing and wipes the seal key
+    pub fn end_session(&self) {
+        todo!("task 9")
     }
 }
 
@@ -872,5 +895,330 @@ mod tests {
 
         assert!(!logger.is_available());
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep me\n");
+    }
+    // --- the seal (task 9) ---
+
+    const PW: &str = "correct horse battery";
+
+    // a real user with an open session, as after a successful login
+    fn session(data: &DataDir, name: &str) -> Session {
+        crate::vault::storage::create_user_with_params(
+            data,
+            &user(name),
+            PW,
+            crate::vault::crypto::KdfParams::TEST,
+        )
+        .unwrap()
+    }
+
+    fn seal_path(data: &DataDir, name: &str) -> PathBuf {
+        data.user_file(&user(name), crate::paths::UserFile::Seal)
+    }
+
+    fn read_seal(data: &DataDir, name: &str) -> Value {
+        serde_json::from_slice(&fs::read(seal_path(data, name)).unwrap()).unwrap()
+    }
+
+    fn clean(n: u32) -> LogCheck {
+        LogCheck::Clean {
+            failed_attempts_since_last_session: n,
+        }
+    }
+
+    // one run of the app for alice: log in, a few events, log out. leaves alice's seal on the
+    // last line of the log
+    fn sealed_history(data: &DataDir, alice: &Session) {
+        let logger = Logger::open(data, clock);
+        logger.log(None, Event::AppStart);
+        logger.begin_session(alice, false);
+        for event in [
+            Event::UnlockSucceeded,
+            Event::CredentialAdded,
+            Event::CredentialsListed,
+            Event::PasswordCopied,
+        ] {
+            logger.log(Some(&user("alice")), event);
+        }
+        logger.end_session();
+    }
+
+    // what someone who can write the file but doesn't know the password can do: change a line
+    // and recompute every prev after it, so the chain itself looks intact
+    fn rechain(lines: &mut [String]) {
+        for i in 1..lines.len() {
+            let prev = sha_hex(&lines[i - 1]);
+            let mut json: Value = serde_json::from_str(&lines[i]).unwrap();
+            json["prev"] = prev.into();
+            lines[i] = serde_json::to_string(&json).unwrap();
+        }
+    }
+
+    // nothing to compare against yet: the first login is clean and leaves a private seal
+    #[test]
+    fn first_session_is_clean() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        let logger = Logger::open(&data, clock);
+        logger.log(None, Event::AppStart);
+
+        assert_eq!(logger.begin_session(&alice, false), clean(0));
+
+        assert!(seal_path(&data, "alice").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(seal_path(&data, "alice"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    // a log nobody touched verifies at the next login, with other runs in between
+    #[test]
+    fn untouched_log_verifies_next_time() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        sealed_history(&data, &alice);
+        Logger::open(&data, clock).log(None, Event::AppStart);
+
+        let logger = Logger::open(&data, clock);
+
+        assert_eq!(logger.begin_session(&alice, true), clean(0));
+    }
+
+    // while a session is open the seal always points at the newest line; after it ends,
+    // other events no longer move it
+    #[test]
+    fn seal_follows_every_event() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        let logger = Logger::open(&data, clock);
+        logger.log(None, Event::AppStart);
+        logger.begin_session(&alice, false);
+
+        for _ in 0..5 {
+            logger.log(Some(&user("alice")), Event::CredentialAdded);
+            let last = lines(&data.log_file()).pop().unwrap();
+            let last_json: Value = serde_json::from_str(&last).unwrap();
+            let seal = read_seal(&data, "alice");
+            assert_eq!(seal["seq"], last_json["seq"]);
+            assert_eq!(seal["hash"], sha_hex(&last).as_str());
+            let mut keys: Vec<_> = seal.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            assert_eq!(keys, ["hash", "mac", "seq"]);
+        }
+
+        logger.end_session();
+        let sealed = fs::read(seal_path(&data, "alice")).unwrap();
+        logger.log(None, Event::AppExit { code: 0 });
+        assert_eq!(fs::read(seal_path(&data, "alice")).unwrap(), sealed);
+    }
+
+    // every change to what alice sealed is caught at her next login, including the one the
+    // chain alone misses: an edit with every later link recomputed
+    #[test]
+    fn sealed_history_edits_are_detected() {
+        type Edit = fn(&DataDir, &mut Vec<String>);
+        let cases: [(&str, Edit, Option<TamperProblem>); 7] = [
+            (
+                "byte changed in a middle line",
+                |_, l| l[2] = l[2].replacen(&TS.to_string(), &(TS + 1).to_string(), 1),
+                None,
+            ),
+            (
+                "byte changed in the sealed line",
+                |_, l| {
+                    let last = l.len() - 1;
+                    l[last] = l[last].replacen(&TS.to_string(), &(TS + 1).to_string(), 1);
+                },
+                Some(TamperProblem::SealMismatch),
+            ),
+            (
+                "edited and rechained",
+                |_, l| {
+                    l[2] = l[2].replace("credential_added", "credentials_listed");
+                    rechain(l);
+                },
+                Some(TamperProblem::SealMismatch),
+            ),
+            (
+                "sealed line deleted",
+                |_, l| {
+                    l.pop();
+                },
+                Some(TamperProblem::SealedEntryMissing),
+            ),
+            ("lines swapped", |_, l| l.swap(2, 3), None),
+            (
+                "truncated before the seal",
+                |_, l| l.truncate(2),
+                Some(TamperProblem::SealedEntryMissing),
+            ),
+            (
+                "log deleted",
+                |data, l| {
+                    l.clear();
+                    fs::remove_file(data.log_file()).unwrap();
+                },
+                Some(TamperProblem::SealedEntryMissing),
+            ),
+        ];
+        for (name, edit, expected) in cases {
+            let (_dir, data) = data_dir();
+            let alice = session(&data, "alice");
+            sealed_history(&data, &alice);
+            let mut lines = lines(&data.log_file());
+            edit(&data, &mut lines);
+            if !lines.is_empty() {
+                write_lines(&data.log_file(), &lines);
+            }
+
+            let check = Logger::open(&data, clock).begin_session(&alice, true);
+
+            match expected {
+                Some(problem) => assert_eq!(check, LogCheck::Tampered(problem), "{name}"),
+                None => assert!(matches!(check, LogCheck::Tampered(_)), "{name}: {check:?}"),
+            }
+        }
+    }
+
+    // deleting the seal must not pass for a first login: the vault remembers there was one
+    #[test]
+    fn deleted_seal_is_detected() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        sealed_history(&data, &alice);
+        fs::remove_file(seal_path(&data, "alice")).unwrap();
+
+        let check = Logger::open(&data, clock).begin_session(&alice, true);
+
+        assert_eq!(check, LogCheck::Tampered(TamperProblem::SealMismatch));
+    }
+
+    // a seal without the right mac, or one that isn't a seal at all, is refused
+    #[test]
+    fn forged_seal_is_detected() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        sealed_history(&data, &alice);
+        let mut seal = read_seal(&data, "alice");
+        seal["mac"] = ZEROS.into();
+
+        for forged in [serde_json::to_vec(&seal).unwrap(), b"garbage".to_vec()] {
+            fs::write(seal_path(&data, "alice"), forged).unwrap();
+            set_mode(&seal_path(&data, "alice"), 0o600);
+
+            let check = Logger::open(&data, clock).begin_session(&alice, true);
+
+            assert_eq!(check, LogCheck::Tampered(TamperProblem::SealMismatch));
+        }
+    }
+
+    // each user's seal key comes from their own vault key, so alice's seal means nothing to bob
+    #[test]
+    fn another_users_seal_does_not_verify() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        let bob = session(&data, "bob");
+        sealed_history(&data, &alice);
+        fs::copy(seal_path(&data, "alice"), seal_path(&data, "bob")).unwrap();
+
+        let check = Logger::open(&data, clock).begin_session(&bob, true);
+
+        assert_eq!(check, LogCheck::Tampered(TamperProblem::SealMismatch));
+    }
+
+    // lines added after alice's session, chained correctly, are accepted: other users and
+    // failed logins write there. this is the documented limit of the seal
+    #[test]
+    fn entries_after_the_seal_are_accepted() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        sealed_history(&data, &alice);
+        let other = Logger::open(&data, clock);
+        for _ in 0..3 {
+            other.log(Some(&user("bob")), Event::CredentialAdded);
+        }
+
+        let check = Logger::open(&data, clock).begin_session(&alice, true);
+
+        assert_eq!(check, clean(0));
+    }
+
+    // alice is told how often someone tried her password while she was away: only her own
+    // failures, and only since her last session
+    #[test]
+    fn failed_attempts_are_counted() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        let bad = |failures| Event::UnlockFailed(UnlockFailure::BadCredentials { failures });
+        Logger::open(&data, clock).log(Some(&user("alice")), bad(1)); // before her last session
+        sealed_history(&data, &alice);
+
+        let other = Logger::open(&data, clock);
+        other.log(Some(&user("alice")), bad(1));
+        other.log(Some(&user("bob")), bad(1));
+        other.log(None, Event::UnlockFailed(UnlockFailure::UnknownUser));
+        other.log(Some(&user("alice")), Event::CredentialsListed);
+        other.log(Some(&user("alice")), bad(2));
+
+        let check = Logger::open(&data, clock).begin_session(&alice, true);
+
+        assert_eq!(check, clean(2));
+    }
+
+    // a detected change is logged once, and the seal moves on, so the same warning doesn't
+    // come back at every login
+    #[test]
+    fn tamper_warning_does_not_repeat() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        sealed_history(&data, &alice);
+        let mut lines = lines(&data.log_file());
+        lines[2] = lines[2].replace("credential_added", "credentials_listed");
+        rechain(&mut lines);
+        write_lines(&data.log_file(), &lines);
+
+        let logger = Logger::open(&data, clock);
+        assert_eq!(
+            logger.begin_session(&alice, true),
+            LogCheck::Tampered(TamperProblem::SealMismatch)
+        );
+        let last = lines_after(&data);
+        assert_eq!(last["event"], "log_tamper_detected");
+        assert_eq!(last["problem"], "seal_mismatch");
+        assert_eq!(last["user"], "alice");
+        logger.end_session();
+
+        let check = Logger::open(&data, clock).begin_session(&alice, true);
+
+        assert_eq!(check, clean(0));
+    }
+
+    fn lines_after(data: &DataDir) -> Value {
+        serde_json::from_str(&lines(&data.log_file()).pop().unwrap()).unwrap()
+    }
+
+    // a long absence rotates the sealed line out of both files; the check says so rather than
+    // passing or crashing
+    #[test]
+    fn sealed_entry_rotated_away() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        let logger = Logger::open_with_limit(&data, clock, 400);
+        logger.log(None, Event::AppStart);
+        logger.begin_session(&alice, false);
+        logger.log(Some(&user("alice")), Event::CredentialAdded);
+        logger.end_session();
+        let other = Logger::open_with_limit(&data, clock, 400);
+        for _ in 0..30 {
+            other.log(Some(&user("bob")), Event::CredentialsListed);
+        }
+
+        let check = Logger::open_with_limit(&data, clock, 400).begin_session(&alice, true);
+
+        assert_eq!(check, LogCheck::Tampered(TamperProblem::SealedEntryMissing));
     }
 }

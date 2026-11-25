@@ -952,7 +952,23 @@ mod tests {
 
         let session = unlock(&data, &user("alice"), GOLDEN_PASSWORD).unwrap();
 
-        assert_eq!(load(&session).unwrap(), vault_with_github());
+        let vault = load(&session).unwrap();
+        assert_eq!(vault, vault_with_github());
+        // written before the log seal existed
+        assert!(!vault.log_sealed());
+    }
+
+    // the log seal flag survives encryption and the trip to disk
+    #[test]
+    fn log_sealed_flag_is_saved() {
+        let (_dir, data) = data_dir();
+        let session = new_user(&data, "alice");
+        let mut vault = load(&session).unwrap();
+        vault.mark_log_sealed();
+
+        save(&session, &vault).unwrap();
+
+        assert!(load(&session).unwrap().log_sealed());
     }
 
     const GOLDEN_V2: &str = include_str!("../../tests/fixtures/vault_v2.json");

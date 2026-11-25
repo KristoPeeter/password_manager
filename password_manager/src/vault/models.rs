@@ -39,6 +39,17 @@ impl From<ValidationError> for VaultError {
 }
 
 impl Vault {
+    // set after the first log seal, so a deleted log.seal can't pass for a first login
+    #[allow(dead_code)] // the login screen, task 11
+    pub fn log_sealed(&self) -> bool {
+        todo!("task 9")
+    }
+
+    #[allow(dead_code)] // the login screen, task 11
+    pub fn mark_log_sealed(&mut self) {
+        todo!("task 9")
+    }
+
     pub fn get(&self, service: &str) -> Option<&Credential> {
         self.credentials.iter().find(|c| c.service == service)
     }
@@ -334,5 +345,20 @@ mod tests {
             Some(Field::Password)
         );
         assert_eq!(vault.get("service1"), Some(&credential("service1")));
+    }
+
+    // the flag is stored in the vault, and vaults written before it existed read as unsealed
+    #[test]
+    fn log_sealed_flag_round_trips() {
+        let mut vault = Vault::default();
+        assert!(!vault.log_sealed());
+
+        vault.mark_log_sealed();
+        let json = serde_json::to_string(&vault).unwrap();
+        let back: Vault = serde_json::from_str(&json).unwrap();
+        assert!(back.log_sealed());
+
+        let old: Vault = serde_json::from_str(r#"{"credentials":[]}"#).unwrap();
+        assert!(!old.log_sealed());
     }
 }
