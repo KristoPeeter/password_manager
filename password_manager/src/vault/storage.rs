@@ -305,6 +305,13 @@ pub(crate) fn create_user_with_params(
     }
 }
 
+// asked before the password prompt, so nobody types a password for a name that can't be used. Ok for a free name or a half-created folder, UserExists for a real user, AccessDenied when something is planted at the folder or the vault path. looks at each entry itself, never through a link
+#[allow(dead_code)] // review round 2
+pub fn check_new_user(dir: &DataDir, user: &Username) -> Result<(), StorageError> {
+    let _ = (dir, user);
+    todo!("review round 2")
+}
+
 pub fn unlock(dir: &DataDir, user: &Username, password: &str) -> Result<Session, StorageError> {
     let user_dir = dir.user_dir(user);
     let vault = dir.user_file(user, UserFile::Vault);
@@ -1390,5 +1397,67 @@ mod tests {
             let message = error.to_string();
             assert!(allowed.contains(&message.as_str()), "{message:?}");
         }
+    }
+
+    // a count left in a half-created folder belongs to nobody: the new user starts with none
+    #[test]
+    fn create_user_clears_leftover_attempts() {
+        let (_dir, data) = data_dir();
+        leave_half_created_user(&data, "alice", false);
+        let attempts = data.user_file(&user("alice"), UserFile::Attempts);
+        fs::write(&attempts, br#"{"failures":8,"last_failure":0}"#).unwrap();
+        set_mode(&attempts, 0o600);
+
+        drop(new_user(&data, "alice"));
+
+        assert!(!attempts.exists());
+    }
+
+    // the master password rules hold here too, not only in the ui, and after nfkc: four "a" plus a combining umlaut are four characters. a refused password leaves nothing on disk
+    #[test]
+    fn create_user_refuses_an_invalid_master_password() {
+        for bad in ["short".to_string(), "a\u{308}".repeat(4), "a".repeat(1025)] {
+            let (_dir, data) = data_dir();
+
+            let result = create_user_with_params(&data, &user("alice"), &bad, KdfParams::TEST);
+
+            assert!(result.is_err(), "{bad:?} accepted");
+            assert!(!data.user_dir(&user("alice")).exists(), "{bad:?}");
+        }
+    }
+
+    // the answers the create flow needs before it asks for a password
+    #[test]
+    fn check_new_user_answers_before_any_password() {
+        let (_dir, data) = data_dir();
+        drop(new_user(&data, "carol"));
+        leave_half_created_user(&data, "bob", true);
+
+        assert!(check_new_user(&data, &user("alice")).is_ok());
+        assert!(check_new_user(&data, &user("bob")).is_ok());
+        assert!(matches!(
+            check_new_user(&data, &user("carol")),
+            Err(StorageError::UserExists)
+        ));
+    }
+
+    // exists() follows links, so a dangling one at vault.json would read as a free name and the user would type a password for nothing. a planted link is refused, not reported as taken
+    #[cfg(unix)]
+    #[test]
+    fn check_new_user_refuses_planted_links() {
+        use std::os::unix::fs::symlink;
+        let (dir, data) = data_dir();
+        leave_half_created_user(&data, "bob", false);
+        symlink(dir.path().join("nowhere"), vault_path(&data, "bob")).unwrap();
+        symlink(dir.path(), data.user_dir(&user("dave"))).unwrap();
+
+        assert_eq!(
+            access_denied(check_new_user(&data, &user("bob"))),
+            Some(AccessCheck::Symlink)
+        );
+        assert_eq!(
+            access_denied(check_new_user(&data, &user("dave"))),
+            Some(AccessCheck::Symlink)
+        );
     }
 }

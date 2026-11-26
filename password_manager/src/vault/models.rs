@@ -361,4 +361,15 @@ mod tests {
         let old: Vault = serde_json::from_str(r#"{"credentials":[]}"#).unwrap();
         assert!(!old.log_sealed());
     }
+
+    // "é" can be typed as one character or as "e" plus an accent; both spellings are the same service
+    #[test]
+    fn add_detects_duplicate_after_normalisation() {
+        let mut vault = vault_multiple(&["caf\u{e9}"]);
+
+        let result = vault.add(credential_with("cafe\u{301}", "user", "pass"));
+
+        assert_eq!(result, Err(VaultError::DuplicateService));
+        assert_eq!(vault.services(), vec!["caf\u{e9}"]);
+    }
 }

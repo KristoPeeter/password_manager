@@ -418,4 +418,128 @@ mod tests {
 
         assert!(storage::load(&session).unwrap().is_empty());
     }
+
+    fn private_folder(path: &Path) {
+        fs::create_dir(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    // a folder without a vault is not a user yet, so not even an oversized password starts a count there: a count left behind would lock out whoever creates the name later
+    #[test]
+    fn oversized_password_for_half_created_user_is_not_counted() {
+        let (_dir, data) = data_dir();
+        private_folder(&data.user_dir(&user("alice")));
+        let oversized = "a".repeat(MAX_PASSWORD_BYTES + 1);
+
+        for _ in 0..3 {
+            let error = login_error(&data, "alice", &oversized, NOW);
+            assert!(
+                matches!(
+                    error,
+                    LoginError::BadCredentials {
+                        known_user: false,
+                        failure: None
+                    }
+                ),
+                "{error:?}"
+            );
+        }
+        assert!(!attempts_path(&data, "alice").exists());
+    }
+
+    // a user folder that links somewhere else is refused before attempts.json is read or written, so the link can't be used to create or overwrite a file outside the data folder
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_user_folder_is_refused_before_attempts_are_touched() {
+        use crate::vault::access::AccessCheck;
+        use std::os::unix::fs::symlink;
+        let (dir, data) = data_dir();
+        let outside = dir.path().join("outside");
+        private_folder(&outside);
+        let planted = outside.join("attempts.json");
+        fs::write(&planted, "DO_NOT_TOUCH").unwrap();
+        symlink(&outside, data.user_dir(&user("bob"))).unwrap();
+        let oversized = "a".repeat(MAX_PASSWORD_BYTES + 1);
+
+        assert_eq!(lock_state(&data, &user("bob"), NOW), LockState::Open);
+        for password in [WRONG, oversized.as_str()] {
+            let error = login_error(&data, "bob", password, NOW);
+            assert!(
+                matches!(
+                    error,
+                    LoginError::Storage(StorageError::AccessDenied(AccessCheck::Symlink))
+                ),
+                "{error:?}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&planted).unwrap(), "DO_NOT_TOUCH");
+
+        // nothing there to begin with: nothing gets created either
+        fs::remove_file(&planted).unwrap();
+        lock_state(&data, &user("bob"), NOW);
+        login_error(&data, "bob", &oversized, NOW);
+        assert!(!planted.exists());
+    }
+
+    // the oversized-password shortcut must not skip the checks unlock would have made
+    #[cfg(unix)]
+    #[test]
+    fn loose_user_folder_is_refused_before_attempts_are_touched() {
+        use crate::vault::access::AccessCheck;
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, data) = data_dir();
+        existing_user(&data, "alice", PW);
+        let folder = data.user_dir(&user("alice"));
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = login_error(&data, "alice", &"a".repeat(MAX_PASSWORD_BYTES + 1), NOW);
+
+        assert!(
+            matches!(
+                error,
+                LoginError::Storage(StorageError::AccessDenied(AccessCheck::Mode))
+            ),
+            "{error:?}"
+        );
+        assert!(!attempts_path(&data, "alice").exists());
+    }
+
+    // logins started at the same moment must not slip past the lockout: attempts for one user are taken one at a time, so exactly three wrong passwords are tried and the rest are refused
+    #[test]
+    fn parallel_wrong_passwords_still_lock_after_three() {
+        const RACERS: usize = 8;
+        let (_dir, data) = data_dir();
+        existing_user(&data, "alice", PW);
+        let start = std::sync::Barrier::new(RACERS);
+
+        let errors: Vec<LoginError> = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    s.spawn(|| {
+                        start.wait();
+                        login_error(&data, "alice", WRONG, NOW)
+                    })
+                })
+                .collect();
+            racers.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+
+        let tried = errors
+            .iter()
+            .filter(|e| matches!(e, LoginError::BadCredentials { .. }))
+            .count();
+        let refused = errors
+            .iter()
+            .filter(|e| matches!(e, LoginError::Locked { .. }))
+            .count();
+        assert_eq!((tried, refused), (3, RACERS - 3), "{errors:?}");
+        assert_eq!(
+            lock_state(&data, &user("alice"), NOW),
+            LockState::Locked { remaining_secs: 30 }
+        );
+    }
 }

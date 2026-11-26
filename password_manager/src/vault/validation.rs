@@ -222,4 +222,44 @@ mod tests {
         assert!(service(&"ä".repeat(65)).is_err());
         assert!(credential_username(&"ä".repeat(254)).is_ok());
     }
+
+    // the limits apply to what argon2 actually gets, after nfkc: "a" plus a combining umlaut is one character, and some single characters expand to dozens
+    #[test]
+    fn master_password_limits_apply_after_normalisation() {
+        assert_eq!(master_password(&"a\u{308}".repeat(4)), TOO_SHORT);
+        assert_eq!(master_password(&"a\u{308}".repeat(8)), Ok(()));
+        // U+FDFA is 3 bytes, and 18 characters (33 bytes) after nfkc
+        let expands = "\u{FDFA}".repeat(40);
+        assert!(expands.len() <= 1024);
+        assert_eq!(master_password(&expands), TOO_LONG);
+    }
+
+    // characters that reorder or break the text around them would let a stored name look like a different one on screen or in the log
+    #[test]
+    fn bidi_controls_and_line_separators_are_rejected() {
+        for bad in [
+            "a\u{202a}b", // left-to-right embedding
+            "a\u{202e}b", // right-to-left override
+            "a\u{2066}b", // left-to-right isolate
+            "a\u{2069}b", // pop directional isolate
+            "a\u{200e}b", // left-to-right mark
+            "a\u{200f}b", // right-to-left mark
+            "a\u{2028}b", // line separator
+            "a\u{2029}b", // paragraph separator
+        ] {
+            assert_eq!(field_of(service(bad)), Some(Field::Service), "{bad:?}");
+            assert_eq!(
+                field_of(credential_username(bad)),
+                Some(Field::Username),
+                "{bad:?}"
+            );
+        }
+    }
+
+    // é typed as one character or as e plus a combining accent is the same service
+    #[test]
+    fn service_is_nfc_normalised() {
+        assert_eq!(service("cafe\u{301}"), Ok("caf\u{e9}".to_string()));
+        assert_eq!(service("caf\u{e9}"), Ok("caf\u{e9}".to_string()));
+    }
 }

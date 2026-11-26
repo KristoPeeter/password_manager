@@ -1397,4 +1397,69 @@ mod tests {
 
         assert_eq!(check, LogCheck::Tampered(TamperProblem::SealedEntryMissing));
     }
+
+    // with nothing rotated, the log must start at the first line ever written: cutting lines off the front leaves every remaining link intact, so only the missing start can show it
+    #[test]
+    fn cut_off_start_of_the_log_is_detected() {
+        let (_dir, data) = data_dir();
+        let logger = Logger::open(&data, clock);
+        for _ in 0..5 {
+            logger.log(Some(&user("alice")), Event::CredentialAdded);
+        }
+        let mut kept = lines(&data.log_file());
+        kept.drain(..2);
+        write_lines(&data.log_file(), &kept);
+
+        assert_eq!(read_chain(&data).err(), Some(TamperProblem::ChainBroken));
+    }
+
+    // the red-team case: lines before alice's sealed one are deleted. her sealed line is still there and still verifies, so the seal alone doesn't notice
+    #[test]
+    fn cut_off_start_is_reported_at_login() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        let logger = Logger::open(&data, clock);
+        for _ in 0..3 {
+            logger.log(Some(&user("bob")), Event::CredentialsListed);
+        }
+        sealed_history(&data, &alice);
+        let mut kept = lines(&data.log_file());
+        kept.drain(..2);
+        write_lines(&data.log_file(), &kept);
+
+        let check = Logger::open(&data, clock).begin_session(&alice, true);
+
+        assert_eq!(check, LogCheck::Tampered(TamperProblem::ChainBroken));
+    }
+
+    // logging is best-effort: another process holding the append lock must not hang the app. after a short wait the line is dropped, and logging works again once the lock is free
+    #[test]
+    fn held_append_lock_does_not_hang() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_dir, data) = data_dir();
+        let logger = Logger::open(&data, clock);
+        // the first event creates the lock file the way the app does
+        logger.log(None, Event::AppStart);
+        let holder = fs::OpenOptions::new()
+            .write(true)
+            .open(data.log_file().with_extension("log.lock"))
+            .unwrap();
+        holder.lock().unwrap();
+
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            logger.log(None, Event::AppExit { code: 0 });
+            let _ = done.send(());
+        });
+
+        assert!(
+            finished.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "log() is still waiting for the lock"
+        );
+        assert_eq!(lines(&data.log_file()).len(), 1);
+        drop(holder);
+        Logger::open(&data, clock).log(None, Event::AppExit { code: 0 });
+        assert_eq!(lines(&data.log_file()).len(), 2);
+    }
 }

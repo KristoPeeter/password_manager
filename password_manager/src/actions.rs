@@ -86,6 +86,13 @@ pub(crate) fn create_user_with_params(
     Ok(LoggedIn { session, check })
 }
 
+// asked before the password prompt of the create flow. a taken name is an ordinary answer and isn't logged; a planted link or a broken folder is logged, without a name since the user doesn't exist
+#[allow(dead_code)] // review round 2
+pub fn check_new_user(dir: &DataDir, log: &Logger, user: &Username) -> Result<(), StorageError> {
+    let _ = (dir, log, user);
+    todo!("review round 2")
+}
+
 pub fn login(
     dir: &DataDir,
     log: &Logger,
@@ -897,5 +904,31 @@ mod tests {
             check_new_service(&session, &log, " gitlab ").unwrap(),
             "gitlab"
         );
+    }
+
+    // the name is checked before the password is asked for: a taken one is an ordinary answer, a planted link is an access problem and is logged as one
+    #[cfg(unix)]
+    #[test]
+    fn new_user_name_is_checked_before_the_password_prompt() {
+        use std::os::unix::fs::symlink;
+        let (dir, data) = data_dir();
+        let (session, log) = alice(&data);
+        drop(session);
+
+        assert!(matches!(
+            check_new_user(&data, &log, &user("alice")),
+            Err(StorageError::UserExists)
+        ));
+        assert!(check_new_user(&data, &log, &user("bob")).is_ok());
+        assert!(names(&data).is_empty());
+
+        symlink(dir.path(), data.user_dir(&user("bob"))).unwrap();
+        assert!(matches!(
+            check_new_user(&data, &log, &user("bob")),
+            Err(StorageError::AccessDenied(AccessCheck::Symlink))
+        ));
+        let event = last_event(&data);
+        assert_eq!(event["event"], "access_denied");
+        assert_eq!(event["user"], Value::Null);
     }
 }

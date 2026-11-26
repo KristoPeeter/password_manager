@@ -16,7 +16,8 @@ use clipboard::{CLEAR_AFTER, ClipboardManager};
 use crate::actions::{self, LoggedIn, OpError};
 use crate::audit::{Event, LogCheck, Logger};
 use crate::hardening;
-use crate::paths::{DataDir, UserFile, Username};
+use crate::paths::{DataDir, PathsError, UserFile, Username};
+use crate::vault::access::AccessError;
 use crate::vault::auth::LoginError;
 use crate::vault::lockout::LockState;
 use crate::vault::storage::{Session, StorageError};
@@ -151,6 +152,21 @@ pub(crate) fn message_for_log_check(check: &LogCheck) -> Option<String> {
             "{n} failed unlock attempts for this user since your last session"
         )),
     }
+}
+
+// why the data folder can't be used, for the one message shown before exiting
+#[allow(dead_code)] // review round 2
+#[derive(Debug)]
+pub(crate) enum DataDirError {
+    Paths(PathsError),
+    Access(AccessError),
+}
+
+// says which setup problem it is, so the user can fix it; still no path and no os error text
+#[allow(dead_code)] // review round 2
+pub(crate) fn message_for_data_dir(e: &DataDirError) -> String {
+    let _ = e;
+    todo!("review round 2")
 }
 
 fn now() -> u64 {
@@ -491,8 +507,8 @@ fn select_service(session: &Session, log: &Logger) -> Result<Option<String>, Act
 mod tests {
     use super::*;
     use crate::audit::TamperProblem;
-    use std::io;
     use crate::vault::lockout::Failure;
+    use std::io;
 
     // the spec's two menus, in order. there is no entry that shows a password: copy only
     #[test]
@@ -621,5 +637,50 @@ mod tests {
             .split(|c: char| !(c.is_alphanumeric() || c == '_'))
             .any(|word| word == "Vault");
         assert!(!holds_vault, "ui names the Vault type");
+    }
+
+    // a setup problem says which one it is; an os error still shows only the fixed text
+    #[test]
+    fn startup_messages_say_what_is_wrong() {
+        use crate::vault::access::AccessCheck;
+        let cases = [
+            (
+                DataDirError::Paths(PathsError::NotAbsolute),
+                "SECUREVAULT_HOME must be an absolute path",
+            ),
+            (
+                DataDirError::Paths(PathsError::ParentComponent),
+                "SECUREVAULT_HOME must not contain \"..\"",
+            ),
+            (
+                DataDirError::Paths(PathsError::NoHome),
+                "Couldn't find a folder to store data in",
+            ),
+            (
+                DataDirError::Access(AccessError::Denied(AccessCheck::Mode)),
+                "Access denied",
+            ),
+            (
+                DataDirError::Access(AccessError::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "/home/alice/.local/share/securevault: os error 13",
+                ))),
+                "Could not access vault storage",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(message_for_data_dir(&error), expected, "{error:?}");
+        }
+    }
+
+    // exists() follows links: a dangling one at a vault path reads as "nothing there". the ui asks actions instead, which looks at the entry itself
+    #[test]
+    fn ui_never_checks_a_path_itself() {
+        let source = include_str!("mod.rs");
+        let code = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+
+        for call in [".exists()", ".try_exists()", "fs::"] {
+            assert!(!code.contains(call), "ui calls {call}");
+        }
     }
 }
