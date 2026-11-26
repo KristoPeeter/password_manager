@@ -11,7 +11,9 @@ use zeroize::Zeroizing;
 
 use super::access::{self, AccessCheck, AccessError};
 use super::crypto::{self, KdfParams, Key, NONCE_LEN, SALT_LEN};
+use super::lockout;
 use super::models::Vault;
+use super::validation;
 use crate::paths::{DataDir, UserFile, Username};
 use std::io::{Read, Write};
 
@@ -41,6 +43,8 @@ pub enum StorageError {
     TooLarge,
     UserExists,
     AlreadyOpen,
+    // the ui checks the rules first, so this only stops a caller that skipped them
+    InvalidPassword,
 }
 
 impl fmt::Display for StorageError {
@@ -53,6 +57,7 @@ impl fmt::Display for StorageError {
             StorageError::TooLarge => "Vault is too large to save",
             StorageError::UserExists => "Username is not available",
             StorageError::AlreadyOpen => "This vault is already open in another session",
+            StorageError::InvalidPassword => "Master password does not meet the requirements",
         };
         write!(f, "{message}")
     }
@@ -210,6 +215,16 @@ fn derive(password: &str, salt: &[u8; SALT_LEN], params: &KdfParams) -> Result<K
 
 // one lock per user. try_lock fails at once instead of waiting, second session always fails
 fn take_lock(path: &Path) -> Result<File, StorageError> {
+    let file = open_lock_file(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(StorageError::AlreadyOpen),
+        Err(fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+// opens (or creates, 0600) a file that is only ever locked, never read. shared with the login lock in auth
+pub(crate) fn open_lock_file(path: &Path) -> Result<File, StorageError> {
     // open with create would follow a planted link and create or open its target, so an existing lock file gets the same checks as the vault
     match access::check_file(path) {
         Ok(()) => {}
@@ -224,12 +239,7 @@ fn take_lock(path: &Path) -> Result<File, StorageError> {
         // closes the gap between the check and the open: a link planted in between fails here
         options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
     }
-    let file = options.open(path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(fs::TryLockError::WouldBlock) => Err(StorageError::AlreadyOpen),
-        Err(fs::TryLockError::Error(e)) => Err(e.into()),
-    }
+    Ok(options.open(path)?)
 }
 
 pub(crate) fn create_user_with_params(
@@ -238,6 +248,7 @@ pub(crate) fn create_user_with_params(
     password: &str,
     params: KdfParams,
 ) -> Result<Session, StorageError> {
+    validation::master_password(password).map_err(|_| StorageError::InvalidPassword)?;
     dir.ensure()?;
     let user_dir = dir.user_dir(user);
     let vault = dir.user_file(user, UserFile::Vault);
@@ -269,6 +280,9 @@ pub(crate) fn create_user_with_params(
     };
 
     let result = (|| {
+        if !created_dir {
+            lockout::clear(&dir.user_file(user, UserFile::Attempts))?;
+        }
         let salt = crypto::random_bytes::<SALT_LEN>();
         let key = derive(password, &salt, &params)?;
         let bytes = encrypt_vault(&Vault::default(), user, &key, &salt, params)?;
@@ -293,9 +307,7 @@ pub(crate) fn create_user_with_params(
             _lock: lock,
         }),
         Err(e) => {
-            // only a folder made by this call is removed, and only while its lock is held, so a
-            // session someone else opened can't be deleted. a leftover folder is harmless now
-            // that create reuses it
+            // only a folder made by this call is removed, and only while its lock is held, so a session someone else opened can't be deleted. a leftover folder is harmless now that create reuses it
             if created_dir && !matches!(e, StorageError::UserExists) {
                 let _ = fs::remove_dir_all(&user_dir);
             }
@@ -306,10 +318,29 @@ pub(crate) fn create_user_with_params(
 }
 
 // asked before the password prompt, so nobody types a password for a name that can't be used. Ok for a free name or a half-created folder, UserExists for a real user, AccessDenied when something is planted at the folder or the vault path. looks at each entry itself, never through a link
-#[allow(dead_code)] // review round 2
 pub fn check_new_user(dir: &DataDir, user: &Username) -> Result<(), StorageError> {
-    let _ = (dir, user);
-    todo!("review round 2")
+    dir.check_folders()?;
+    let user_dir = dir.user_dir(user);
+    if !entry_exists(&user_dir)? {
+        return Ok(());
+    }
+    access::check_dir(&user_dir)?;
+    let vault = dir.user_file(user, UserFile::Vault);
+    if !entry_exists(&vault)? {
+        // a half-created user: create reuses the folder
+        return Ok(());
+    }
+    access::check_file(&vault)?;
+    Err(StorageError::UserExists)
+}
+
+// the entry itself, not what it points to: a dangling link exists
+fn entry_exists(path: &Path) -> Result<bool, StorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub fn unlock(dir: &DataDir, user: &Username, password: &str) -> Result<Session, StorageError> {

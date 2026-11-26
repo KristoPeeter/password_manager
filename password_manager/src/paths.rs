@@ -19,15 +19,18 @@ const USERS_FOLDER: &str = "users";
 pub enum UserFile {
     Vault,
     Attempts,
+    // serialises logins for one user, so parallel attempts can't all read the same count
+    AttemptsLock,
     Lock,
     Seal,
 }
 
 impl UserFile {
     #[cfg(test)]
-    const ALL: [UserFile; 4] = [
+    const ALL: [UserFile; 5] = [
         UserFile::Vault,
         UserFile::Attempts,
+        UserFile::AttemptsLock,
         UserFile::Lock,
         UserFile::Seal,
     ];
@@ -36,6 +39,7 @@ impl UserFile {
         match self {
             UserFile::Vault => "vault.json",
             UserFile::Attempts => "attempts.json",
+            UserFile::AttemptsLock => "attempts.lock",
             UserFile::Lock => "lock",
             UserFile::Seal => "log.seal",
         }

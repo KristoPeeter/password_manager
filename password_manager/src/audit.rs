@@ -3,6 +3,8 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
+    thread,
+    time::{Duration, Instant},
 };
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -30,6 +32,9 @@ const GENESIS: [u8; 32] = [0; 32];
 const SEAL_CONTEXT: &[u8] = b"securevault log seal v1";
 // a real seal is about 200 bytes
 const MAX_SEAL_BYTES: u64 = 1024;
+// an append holds the lock for well under a millisecond; anything longer is a stuck or hostile holder, and the event is dropped rather than hanging the app
+const LOCK_WAIT: Duration = Duration::from_millis(500);
+const LOCK_RETRY: Duration = Duration::from_millis(2);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -268,7 +273,7 @@ impl Logger {
     fn append(&self, user: Option<&Username>, event: Event) -> io::Result<(u64, [u8; 32])> {
         // held until the end of this call; the os releases it if the process dies
         let lock = open_private(&self.lock)?;
-        lock.lock()?;
+        wait_for_lock(&lock)?;
 
         // checked on every append, not only at open: the file may have been swapped since
         match access::check_file(&self.log) {
@@ -475,6 +480,20 @@ fn verify_seal(
     }
 }
 
+fn wait_for_lock(file: &File) -> io::Result<()> {
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(LOCK_RETRY);
+            }
+            Err(fs::TryLockError::WouldBlock) => return Err(io::ErrorKind::WouldBlock.into()),
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+}
+
 // append mode, 0600 when created, and never through a symlink
 fn open_private(path: &Path) -> io::Result<File> {
     let mut options = fs::OpenOptions::new();
@@ -543,7 +562,8 @@ pub(crate) struct Entry {
 // events.log.1 then events.log, every seq and prev link checked
 pub(crate) fn read_chain(dir: &DataDir) -> Result<Vec<Entry>, TamperProblem> {
     let mut entries: Vec<Entry> = Vec::new();
-    for path in [dir.rotated_log_file(), dir.log_file()] {
+    // only events.log.1 may start after seq 1: its predecessors rotated away. events.log starts late only after a rotation, so without a rotated file it must begin at the very first line, or the front was cut off
+    for (path, may_start_late) in [(dir.rotated_log_file(), true), (dir.log_file(), false)] {
         let Some(bytes) = read_log(&path)? else {
             continue;
         };
@@ -562,8 +582,10 @@ pub(crate) fn read_chain(dir: &DataDir) -> Result<Vec<Entry>, TamperProblem> {
                 Some(before) => {
                     stored.seq == before.seq + 1 && stored.prev == hex::encode(before.hash)
                 }
-                // the oldest line kept: its predecessor may have rotated away, unless it is the very first line
-                None => stored.seq > 1 || (stored.seq == 1 && stored.prev == hex::encode(GENESIS)),
+                None => {
+                    let first_ever = stored.seq == 1 && stored.prev == hex::encode(GENESIS);
+                    first_ever || (may_start_late && stored.seq > 1)
+                }
             };
             if !linked {
                 return Err(TamperProblem::ChainBroken);

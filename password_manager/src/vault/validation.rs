@@ -1,5 +1,9 @@
 use std::fmt;
 
+use unicode_normalization::UnicodeNormalization;
+
+use super::crypto;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Field {
     Service,
@@ -54,22 +58,42 @@ fn reject_control_characters(input: &str, field: Field) -> Result<(), Validation
     }
 }
 
-// returns the trimmed name, so "github" and "github " can't become two entries
+// text direction controls and line separators aren't control characters, but they reorder or break the text around them, so a shown name could look like a different one. only for what is shown: a password never is
+fn reject_layout_characters(input: &str, field: Field) -> Result<(), ValidationError> {
+    let changes_layout = |c: char| {
+        matches!(
+            c,
+            '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}'
+        )
+    };
+    if input.chars().any(changes_layout) {
+        invalid(
+            field,
+            "Text direction and line separator characters are not allowed",
+        )
+    } else {
+        Ok(())
+    }
+}
+
+// returns the trimmed, nfc-normalised name, so "github " and "github", or é typed two ways, can't become two entries
 pub fn service(input: &str) -> Result<String, ValidationError> {
     reject_control_characters(input, Field::Service)?;
-    let value = input.trim();
+    reject_layout_characters(input, Field::Service)?;
+    let value: String = input.trim().nfc().collect();
     match value.chars().count() {
         0 => invalid(Field::Service, "Service name is required"),
         n if n > MAX_SERVICE_CHARS => {
             invalid(Field::Service, "Service name can be at most 64 characters")
         }
-        _ => Ok(value.to_owned()),
+        _ => Ok(value),
     }
 }
 
 // empty is allowed: some sites only use a password or an email elsewhere
 pub fn credential_username(input: &str) -> Result<String, ValidationError> {
     reject_control_characters(input, Field::Username)?;
+    reject_layout_characters(input, Field::Username)?;
     let value = input.trim();
     if value.chars().count() > MAX_USERNAME_CHARS {
         invalid(Field::Username, "Username can be at most 254 characters")
@@ -90,12 +114,18 @@ pub fn credential_password(input: &str) -> Result<(), ValidationError> {
     reject_control_characters(input, Field::Password)
 }
 
-// min counts characters (what the user sees), max counts bytes (what argon2 has to hash)
+// min counts characters (what the user sees), max counts bytes (what argon2 has to hash). both apply to the nfkc form argon2 actually gets; the raw cap comes first, so a huge input is never normalised
 pub fn master_password(password: &str) -> Result<(), &'static str> {
-    if password.chars().count() < 8 {
-        Err("Master password must be at least 8 characters")
-    } else if password.len() > 1024 {
-        Err("Master password is too long")
+    const TOO_SHORT: &str = "Master password must be at least 8 characters";
+    const TOO_LONG: &str = "Master password is too long";
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(TOO_LONG);
+    }
+    let normalized = crypto::normalize_password(password);
+    if normalized.chars().count() < 8 {
+        Err(TOO_SHORT)
+    } else if normalized.len() > MAX_PASSWORD_BYTES {
+        Err(TOO_LONG)
     } else {
         Ok(())
     }

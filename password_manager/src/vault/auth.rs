@@ -1,5 +1,6 @@
-use std::{fs, path::Path};
+use std::{fs, io, path::Path};
 
+use super::access::{self, AccessError};
 use super::lockout::{self, Failure, LockState};
 use super::storage::{self, Session, StorageError};
 use crate::paths::{DataDir, UserFile, Username};
@@ -21,12 +22,12 @@ pub enum LoginError {
     Storage(StorageError),
 }
 
-// Open for an unknown user, so the lock state never reveals who exists
+// Open for an unknown user, so the lock state never reveals who exists. Open too for a folder that fails the access checks: nothing in it is read or written, and login then refuses it
 pub fn lock_state(dir: &DataDir, user: &Username, now: u64) -> LockState {
-    if !has_folder(dir, user) {
-        return LockState::Open;
+    match user_folder(dir, user) {
+        Ok(true) => lockout::state(&dir.user_file(user, UserFile::Attempts), now),
+        _ => LockState::Open,
     }
-    lockout::state(&dir.user_file(user, UserFile::Attempts), now)
 }
 
 pub fn login(
@@ -35,19 +36,29 @@ pub fn login(
     password: &str,
     now: u64,
 ) -> Result<Session, LoginError> {
-    let attempts = dir.user_file(user, UserFile::Attempts);
-    // the folder ( not the vault ) decides: a lock must hold even if the vault went missing.
-    // a folder without a vault still ends up as an unknown user, through unlock's NotFound
-    let known_user = has_folder(dir, user);
+    // checked before attempts.json is touched: a linked or loose folder would let that file be created or overwritten somewhere else
+    let has_folder = user_folder(dir, user).map_err(LoginError::Storage)?;
+    if !has_folder {
+        return Err(unknown_user(password));
+    }
 
-    // locked out
-    if known_user && let LockState::Locked { remaining_secs } = lockout::state(&attempts, now) {
+    // held until the attempt is counted or cleared, so parallel logins are taken one at a time and can't all read the same count. not the session lock: a wrong password must not learn whether a session is open
+    let attempts_lock = storage::open_lock_file(&dir.user_file(user, UserFile::AttemptsLock))
+        .map_err(LoginError::Storage)?;
+    attempts_lock
+        .lock()
+        .map_err(|e| LoginError::Storage(e.into()))?;
+
+    // the folder ( not the vault ) decides the lock: it must hold even if the vault went missing
+    let attempts = dir.user_file(user, UserFile::Attempts);
+    if let LockState::Locked { remaining_secs } = lockout::state(&attempts, now) {
         return Err(LoginError::Locked { remaining_secs });
     }
 
-    // Too long
+    // Too long. only counted against a real vault
     if password.len() > MAX_PASSWORD_BYTES {
-        return Err(wrong_password(known_user, &attempts, now));
+        let has_vault = fs::symlink_metadata(dir.user_file(user, UserFile::Vault)).is_ok();
+        return Err(wrong_password(has_vault, &attempts, now));
     }
 
     match storage::unlock(dir, user, password) {
@@ -55,21 +66,34 @@ pub fn login(
             let _ = lockout::clear(&attempts);
             Ok(session)
         }
-        Err(StorageError::NotFound) => {
-            // the same argon2 work as a real attempt so return time tells nothing about if credentials are actullay there or no
-            storage::dummy_unlock(password);
-            Err(LoginError::BadCredentials {
-                known_user: false,
-                failure: None,
-            })
-        }
+        // a folder without a vault still ends up as an unknown user
+        Err(StorageError::NotFound) => Err(unknown_user(password)),
         Err(StorageError::Unlock) => Err(wrong_password(true, &attempts, now)),
         Err(e) => Err(LoginError::Storage(e)),
     }
 }
 
-fn has_folder(dir: &DataDir, user: &Username) -> bool {
-    fs::symlink_metadata(dir.user_dir(user)).is_ok()
+// Ok(false): no such folder, an unknown user. Err: the folder, or one above it, fails the access checks
+fn user_folder(dir: &DataDir, user: &Username) -> Result<bool, StorageError> {
+    let checked = dir
+        .check_folders()
+        .and_then(|()| access::check_dir(&dir.user_dir(user)));
+    match checked {
+        Ok(()) => Ok(true),
+        Err(AccessError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+// the same argon2 work as a real attempt (unless the password is over the cap, which a real user is refused without it too)
+fn unknown_user(password: &str) -> LoginError {
+    if password.len() <= MAX_PASSWORD_BYTES {
+        storage::dummy_unlock(password);
+    }
+    LoginError::BadCredentials {
+        known_user: false,
+        failure: None,
+    }
 }
 
 // only a real user has an attempts file

@@ -87,10 +87,8 @@ pub(crate) fn create_user_with_params(
 }
 
 // asked before the password prompt of the create flow. a taken name is an ordinary answer and isn't logged; a planted link or a broken folder is logged, without a name since the user doesn't exist
-#[allow(dead_code)] // review round 2
 pub fn check_new_user(dir: &DataDir, log: &Logger, user: &Username) -> Result<(), StorageError> {
-    let _ = (dir, log, user);
-    todo!("review round 2")
+    storage::check_new_user(dir, user).inspect_err(|e| log_storage_failure(log, None, e))
 }
 
 pub fn login(

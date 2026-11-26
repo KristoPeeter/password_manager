@@ -16,7 +16,7 @@ use clipboard::{CLEAR_AFTER, ClipboardManager};
 use crate::actions::{self, LoggedIn, OpError};
 use crate::audit::{Event, LogCheck, Logger};
 use crate::hardening;
-use crate::paths::{DataDir, PathsError, UserFile, Username};
+use crate::paths::{DataDir, PathsError, Username};
 use crate::vault::access::AccessError;
 use crate::vault::auth::LoginError;
 use crate::vault::lockout::LockState;
@@ -155,7 +155,6 @@ pub(crate) fn message_for_log_check(check: &LogCheck) -> Option<String> {
 }
 
 // why the data folder can't be used, for the one message shown before exiting
-#[allow(dead_code)] // review round 2
 #[derive(Debug)]
 pub(crate) enum DataDirError {
     Paths(PathsError),
@@ -163,10 +162,18 @@ pub(crate) enum DataDirError {
 }
 
 // says which setup problem it is, so the user can fix it; still no path and no os error text
-#[allow(dead_code)] // review round 2
 pub(crate) fn message_for_data_dir(e: &DataDirError) -> String {
-    let _ = e;
-    todo!("review round 2")
+    match e {
+        DataDirError::Paths(e) => e.to_string(),
+        DataDirError::Access(AccessError::Denied(_)) => "Access denied".to_string(),
+        DataDirError::Access(AccessError::Io(_)) => STORAGE_UNAVAILABLE.to_string(),
+    }
+}
+
+fn open_data_dir() -> Result<DataDir, DataDirError> {
+    let data = DataDir::resolve().map_err(DataDirError::Paths)?;
+    data.ensure().map_err(DataDirError::Access)?;
+    Ok(data)
 }
 
 fn now() -> u64 {
@@ -179,10 +186,10 @@ pub fn run() -> ExitCode {
     hardening::install_panic_hook();
     hardening::disable_core_dumps();
 
-    let data = match DataDir::resolve() {
-        Ok(data) if data.ensure().is_ok() => data,
-        _ => {
-            eprintln!("{STORAGE_UNAVAILABLE}");
+    let data = match open_data_dir() {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("{}", message_for_data_dir(&e));
             return ExitCode::FAILURE;
         }
     };
@@ -317,9 +324,16 @@ fn create_user(data: &DataDir, log: &Logger) -> Step {
         return Step::Back;
     };
     // asked before the password, so nobody types one for a name that can't be used
-    if data.user_file(&user, UserFile::Vault).exists() {
-        eprintln!("{}", StorageError::UserExists);
-        return Step::Back;
+    match actions::check_new_user(data, log, &user) {
+        Ok(()) => {}
+        Err(e @ StorageError::UserExists) => {
+            eprintln!("{e}");
+            return Step::Back;
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            return Step::Exit(1);
+        }
     }
 
     let password = match Password::new("New master password:")
