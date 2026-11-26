@@ -1,6 +1,3 @@
-// the login flow (task 7) is the only caller; until then only the tests use this module
-#![allow(dead_code)]
-
 use std::{
     fs::{self, File},
     io::{self, Read},

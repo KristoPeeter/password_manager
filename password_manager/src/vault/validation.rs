@@ -9,7 +9,6 @@ pub enum Field {
 
 impl Field {
     // the name that goes into the log, so it is fixed and never contains a value. Logging to be added asap
-    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Field::Service => "service",

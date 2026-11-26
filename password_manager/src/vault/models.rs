@@ -43,12 +43,10 @@ impl From<ValidationError> for VaultError {
 
 impl Vault {
     // set after the first log seal, so a deleted log.seal can't pass for a first login
-    #[allow(dead_code)] // the login screen, task 11
     pub fn log_sealed(&self) -> bool {
         self.log_sealed
     }
 
-    #[allow(dead_code)] // the login screen, task 11
     pub fn mark_log_sealed(&mut self) {
         self.log_sealed = true;
     }
@@ -78,7 +76,6 @@ impl Vault {
         self.credentials.remove(pos);
         Ok(())
     }
-    #[cfg_attr(not(test), allow(dead_code))]
     fn get_mut(&mut self, service: &str) -> Result<&mut Credential, VaultError> {
         self.credentials
             .iter_mut()
@@ -87,7 +84,6 @@ impl Vault {
     }
 
     // not called by the ui until the update menu entry is added (task 11)
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn update_username(&mut self, service: &str, new: &str) -> Result<(), VaultError> {
         let credential = self.get_mut(service)?;
         let username = validation::credential_username(new)?;
@@ -96,7 +92,6 @@ impl Vault {
         Ok(())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     // takes Zeroizing so the caller's copy of the new password is wiped too
     pub fn update_password(
         &mut self,
@@ -111,6 +106,7 @@ impl Vault {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn services(&self) -> Vec<&str> {
         self.credentials
             .iter()
@@ -122,6 +118,7 @@ impl Vault {
         &self.credentials
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.credentials.is_empty()
     }

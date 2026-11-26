@@ -34,11 +34,9 @@ const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB MAX for file sizes
 #[derive(Debug)]
 pub enum StorageError {
     // the error and the check are kept for the log (task 8); the screen only gets fixed text
-    #[allow(dead_code)]
     Io(io::Error),
     NotFound,
     Unlock,
-    #[allow(dead_code)]
     AccessDenied(AccessCheck),
     TooLarge,
     UserExists,
@@ -79,7 +77,6 @@ impl From<AccessError> for StorageError {
 
 // an unlocked vault for one user
 pub struct Session {
-    #[allow(dead_code)] // read through user() by the login flow and the log, tasks 7 and 10
     user: Username,
     data: DataDir,
     user_dir: PathBuf,
@@ -92,12 +89,10 @@ pub struct Session {
 }
 
 impl Session {
-    #[allow(dead_code)] // tasks 7 and 10
     pub fn user(&self) -> &Username {
         &self.user
     }
 
-    #[allow(dead_code)] // the log seal derives its key from this, task 9
     pub(crate) fn key(&self) -> &Key {
         &self.key
     }
@@ -237,14 +232,6 @@ fn take_lock(path: &Path) -> Result<File, StorageError> {
     }
 }
 
-pub fn create_user(
-    dir: &DataDir,
-    user: &Username,
-    password: &str,
-) -> Result<Session, StorageError> {
-    create_user_with_params(dir, user, password, KdfParams::DEFAULT)
-}
-
 pub(crate) fn create_user_with_params(
     dir: &DataDir,
     user: &Username,
@@ -345,7 +332,6 @@ pub fn unlock(dir: &DataDir, user: &Username, password: &str) -> Result<Session,
 
 // does the same argon2 work as a real unlock and throws it away, so an unknown username
 // takes as long to refuse as a wrong password (used by the login flow, task 7)
-#[allow(dead_code)]
 pub(crate) fn dummy_unlock(password: &str) {
     let salt = crypto::random_bytes::<SALT_LEN>();
     let _ = derive(password, &salt, &KdfParams::DEFAULT);

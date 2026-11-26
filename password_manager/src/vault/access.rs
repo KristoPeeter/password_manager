@@ -11,7 +11,6 @@ pub enum AccessCheck {
 
 impl AccessCheck {
     // the name that goes into the log
-    #[allow(dead_code)] // audit log, task 8
     pub fn as_str(self) -> &'static str {
         match self {
             AccessCheck::Symlink => "symlink",

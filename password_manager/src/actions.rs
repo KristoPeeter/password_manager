@@ -1,6 +1,3 @@
-// the menu (task 11) is the only caller; until then only the tests use this module
-#![allow(dead_code)]
-
 // each record operation in one place: load, act, save, log. the ui only prompts and prints, so no menu path can skip the logging or the validation
 
 use std::fmt;
@@ -12,9 +9,10 @@ use crate::paths::{DataDir, Username};
 use crate::ui::clipboard::{ClipboardBackend, ClipboardManager};
 use crate::vault::auth::{self, LoginError};
 use crate::vault::crypto::KdfParams;
+use crate::vault::lockout::LockState;
 use crate::vault::models::{Credential, Vault, VaultError};
 use crate::vault::storage::{self, Session, StorageError};
-use crate::vault::validation::Field;
+use crate::vault::validation::{self, Field};
 
 #[derive(Debug)]
 pub enum OpError {
@@ -108,6 +106,16 @@ pub fn login(
     Ok(LoggedIn { session, check })
 }
 
+// asked before the password prompt, so a locked user isn't asked for a password that can't be
+// checked. a refusal is logged; an unknown user is never locked, so this reveals nothing
+pub fn lock_state(dir: &DataDir, log: &Logger, user: &Username, now: u64) -> LockState {
+    let state = auth::lock_state(dir, user, now);
+    if let LockState::Locked { remaining_secs } = state {
+        log.log(Some(user), Event::UnlockRefusedLocked { remaining_secs });
+    }
+    state
+}
+
 // the only way a session should end: the seal stops following the log, so events after this (someone else's failed logins included) count as "since your last session" next time. dropping the session then releases the vault lock
 pub fn logout(log: &Logger, logged_in: LoggedIn) {
     log.end_session();
@@ -165,7 +173,6 @@ fn log_login_failure(log: &Logger, user: &Username, error: &LoginError) {
     }
 }
 
-
 pub fn list(session: &Session, log: &Logger) -> Result<Vec<Listed>, OpError> {
     let result = storage::load(session).map_err(OpError::from).map(|vault| {
         vault
@@ -178,6 +185,29 @@ pub fn list(session: &Session, log: &Logger) -> Result<Vec<Listed>, OpError> {
             .collect()
     });
     finish(session, log, result, Event::CredentialsListed)
+}
+
+// asked right after the service prompt, so a bad or taken name is reported before the password is
+// typed. returns the name as it will be stored (trimmed). a rejected name is logged like any other
+pub fn check_new_service(
+    session: &Session,
+    log: &Logger,
+    service: &str,
+) -> Result<String, OpError> {
+    let result = (|| {
+        let service = validation::service(service).map_err(VaultError::from)?;
+        let vault = storage::load(session)?;
+        if vault.get(&service).is_some() {
+            return Err(OpError::Vault(VaultError::DuplicateService));
+        }
+        Ok(service)
+    })();
+    if let Err(error) = &result
+        && let Some(event) = failure_event(error)
+    {
+        log.log(Some(session.user()), event);
+    }
+    result
 }
 
 pub fn add(
@@ -812,5 +842,60 @@ mod tests {
         }
         // the run really was logged, so the check above isn't vacuous
         assert!(names(&data).len() >= 15, "{:?}", names(&data));
+    }
+
+    // --- checks the ui makes before asking for a password ---
+
+    // a locked user is told so before typing anything, and the refusal is logged once
+    #[test]
+    fn locked_user_is_reported_before_the_password_prompt() {
+        let (_dir, data) = data_dir();
+        let log = Logger::open(&data, clock);
+        logout(&log, create(&data, &log, "alice", PW));
+        assert_eq!(
+            lock_state(&data, &log, &user("alice"), NOW),
+            LockState::Open
+        );
+        assert_eq!(names(&data).len(), 1, "an open check logs nothing");
+        for _ in 0..3 {
+            login_error(&data, &log, "alice", "wrong", NOW);
+        }
+
+        let state = lock_state(&data, &log, &user("alice"), NOW + 10);
+
+        assert_eq!(state, LockState::Locked { remaining_secs: 20 });
+        let event = last_event(&data);
+        assert_eq!(event["event"], "unlock_refused_locked");
+        assert_eq!(event["remaining_secs"], 20);
+        assert_eq!(
+            lock_state(&data, &log, &user("nobody"), NOW),
+            LockState::Open
+        );
+    }
+
+    // a bad service name is rejected and logged before the password is typed; a taken one is
+    // reported (unlogged, it's an ordinary mistake), comparing the trimmed name
+    #[test]
+    fn new_service_is_checked_before_the_password_prompt() {
+        let (_dir, data) = data_dir();
+        let (session, log) = alice(&data);
+        add_github(&session, &log);
+
+        let bad = check_new_service(&session, &log, "bad\x1bname");
+        assert!(matches!(bad, Err(OpError::Vault(VaultError::Invalid(_)))));
+        assert_eq!(last_event(&data)["event"], "validation_rejected");
+        let logged = names(&data).len();
+
+        let taken = check_new_service(&session, &log, "  github ");
+        assert!(matches!(
+            taken,
+            Err(OpError::Vault(VaultError::DuplicateService))
+        ));
+        assert_eq!(names(&data).len(), logged);
+
+        assert_eq!(
+            check_new_service(&session, &log, " gitlab ").unwrap(),
+            "gitlab"
+        );
     }
 }

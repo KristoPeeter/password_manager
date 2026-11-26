@@ -1,7 +1,3 @@
-// the record operations (task 10) and the login screen (task 11) are the callers; until then
-// only the tests use this module
-#![allow(dead_code)]
-
 use std::{
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},

@@ -1,6 +1,3 @@
-// the login screen (task 11) is the only caller; until then only the tests use this module
-#![allow(dead_code)]
-
 use std::{fs, path::Path};
 
 use super::lockout::{self, Failure, LockState};

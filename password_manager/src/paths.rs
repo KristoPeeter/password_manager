@@ -18,10 +18,8 @@ const USERS_FOLDER: &str = "users";
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UserFile {
     Vault,
-    #[allow(dead_code)] // lockout state, task 6
     Attempts,
     Lock,
-    #[allow(dead_code)] // log seal, task 9
     Seal,
 }
 
@@ -166,12 +164,10 @@ impl DataDir {
         self.user_dir(user).join(file.name())
     }
 
-    #[allow(dead_code)] // audit log, task 8
     pub fn log_file(&self) -> PathBuf {
         self.0.join("events.log")
     }
 
-    #[allow(dead_code)] // audit log, task 8
     pub fn rotated_log_file(&self) -> PathBuf {
         self.0.join("events.log.1")
     }

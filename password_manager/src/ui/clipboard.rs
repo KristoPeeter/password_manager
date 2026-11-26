@@ -48,6 +48,16 @@ pub struct ClipboardManager<B: ClipboardBackend> {
     clear_after: Duration,
 }
 
+// a clone is another handle to the same clipboard state, for the signal handler's thread
+impl<B: ClipboardBackend> Clone for ClipboardManager<B> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            clear_after: self.clear_after,
+        }
+    }
+}
+
 //if anybody tries to poison the mutex
 fn lock<B>(state: &Mutex<State<B>>) -> MutexGuard<'_, State<B>> {
     state.lock().unwrap_or_else(|e| e.into_inner())
