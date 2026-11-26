@@ -23,3 +23,4 @@ zeroize = { version = "1.9", features = ["derive"] }
 # geteuid without unsafe code; only needed for the unix access checks
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process", "fs"] }
+signal-hook = "0.4.6"

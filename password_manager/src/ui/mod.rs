@@ -1,33 +1,67 @@
 pub(crate) mod clipboard;
 
-use std::{fmt, io, process::ExitCode};
+use std::{
+    fmt,
+    process::ExitCode,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use inquire::{
-    Confirm, InquireError, Password, PasswordDisplayMode, Select, Text, required,
-    validator::Validation,
+    Confirm, InquireError, Password, PasswordDisplayMode, Select, Text, validator::Validation,
 };
 use zeroize::Zeroizing;
 
 use clipboard::{CLEAR_AFTER, ClipboardManager};
 
-use crate::audit::LogCheck;
+use crate::actions::{self, LoggedIn, OpError};
+use crate::audit::{Event, LogCheck, Logger};
+use crate::hardening;
 use crate::paths::{DataDir, UserFile, Username};
 use crate::vault::auth::LoginError;
-use crate::vault::{
-    models::{Credential, Vault, VaultError},
-    storage::{self, Session, StorageError},
-    validation,
-};
+use crate::vault::lockout::LockState;
+use crate::vault::storage::{Session, StorageError};
+use crate::vault::validation;
 
-// temporary bridge until the login screen exists (task 7): one fixed user, so the app keeps
-// working on the new per-user storage. task 11 replaces this
-const BRIDGE_USER: &str = "default";
+// the ui only prompts and prints. every vault or login operation goes through actions, which
+// validates, saves and logs; no decrypted vault is ever held here
+
+const UNLOCK_ATTEMPTS: usize = 3;
+const STORAGE_UNAVAILABLE: &str = "Could not access vault storage";
+const USERNAME_RULES: &str =
+    "1–32 characters: a–z, 0–9, - and _, starting with a letter or a digit";
+
+type SystemClipboard = ClipboardManager<arboard::Clipboard>;
+
+#[derive(Clone, Copy)]
+enum StartupAction {
+    LogIn,
+    CreateUser,
+    Exit,
+}
+
+impl fmt::Display for StartupAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            StartupAction::LogIn => "Log in",
+            StartupAction::CreateUser => "Create new user",
+            StartupAction::Exit => "Exit",
+        };
+        write!(f, "{label}")
+    }
+}
+
+const STARTUP: [StartupAction; 3] = [
+    StartupAction::LogIn,
+    StartupAction::CreateUser,
+    StartupAction::Exit,
+];
 
 #[derive(Clone, Copy)]
 enum MenuAction {
     Add,
     List,
     Copy,
+    Update,
     Delete,
     Exit,
 }
@@ -38,199 +72,241 @@ impl fmt::Display for MenuAction {
             MenuAction::Add => "Add credential",
             MenuAction::List => "List credentials",
             MenuAction::Copy => "Copy password",
+            MenuAction::Update => "Update credential",
             MenuAction::Delete => "Delete credential",
             MenuAction::Exit => "Exit",
         };
-        write!(f, "{}", label)
+        write!(f, "{label}")
     }
 }
 
-const MENU: [MenuAction; 5] = [
+const MENU: [MenuAction; 6] = [
     MenuAction::Add,
     MenuAction::List,
     MenuAction::Copy,
+    MenuAction::Update,
     MenuAction::Delete,
     MenuAction::Exit,
 ];
 
-enum ActionError {
-    Cancelled,
-    Prompt(InquireError),
-    Vault(VaultError),
-    Storage(StorageError),
-    Io(io::Error),
-}
-
-impl fmt::Display for ActionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ActionError::Cancelled => write!(f, "Cancelled"),
-            ActionError::Prompt(e) => write!(f, "Prompt failed: {}", e),
-            ActionError::Vault(e) => write!(f, "{}", e),
-            ActionError::Storage(e) => write!(f, "{}", e),
-            ActionError::Io(e) => write!(f, "Terminal error: {}", e),
-        }
-    }
-}
-
-impl From<InquireError> for ActionError {
-    fn from(e: InquireError) -> Self {
-        match e {
-            InquireError::OperationCanceled | InquireError::OperationInterrupted => {
-                ActionError::Cancelled
-            }
-            other => ActionError::Prompt(other),
-        }
-    }
-}
-
-impl From<VaultError> for ActionError {
-    fn from(e: VaultError) -> Self {
-        ActionError::Vault(e)
-    }
-}
-
-impl From<StorageError> for ActionError {
-    fn from(e: StorageError) -> Self {
-        ActionError::Storage(e)
-    }
-}
-
-impl From<io::Error> for ActionError {
-    fn from(e: io::Error) -> Self {
-        ActionError::Io(e)
-    }
-}
-
-const UNLOCK_ATTEMPTS: usize = 3;
-
-
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // task 11
-enum StartupAction {
-    LogIn,
-    CreateUser,
-    Exit,
+enum UpdateField {
+    Username,
+    Password,
 }
 
-impl fmt::Display for StartupAction {
+impl fmt::Display for UpdateField {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = f;
-        todo!("task 11")
+        let label = match self {
+            UpdateField::Username => "Username",
+            UpdateField::Password => "Password",
+        };
+        write!(f, "{label}")
     }
 }
 
-#[allow(dead_code)] // task 11
-const STARTUP: [StartupAction; 3] = [
-    StartupAction::LogIn,
-    StartupAction::CreateUser,
-    StartupAction::Exit,
-];
-
-// what the main loop does after a prompt fails
+// what happens after a menu-level prompt fails
 #[derive(Debug, PartialEq)]
-#[allow(dead_code)] // task 11
 pub(crate) enum Outcome {
-    Continue,
     Exit(u8),
 }
 
 // Esc and Ctrl-C are the user's choice (exit 0); no terminal or a broken one is a failure (exit 1)
-#[allow(dead_code)] // task 11
 pub(crate) fn outcome_of_prompt_error(e: &InquireError) -> Outcome {
-    let _ = e;
-    todo!("task 11")
+    match e {
+        InquireError::OperationCanceled | InquireError::OperationInterrupted => Outcome::Exit(0),
+        _ => Outcome::Exit(1),
+    }
+}
+
+fn exit_code_of(e: &InquireError) -> u8 {
+    let Outcome::Exit(code) = outcome_of_prompt_error(e);
+    code
 }
 
 // only the spec's fixed messages: a wrong password and an unknown user read the same
-#[allow(dead_code)] // task 11
 pub(crate) fn message_for_login(e: &LoginError) -> String {
-    let _ = e;
-    todo!("task 11")
+    match e {
+        LoginError::Locked { remaining_secs } => {
+            format!("Too many failed attempts. Try again in {remaining_secs} seconds.")
+        }
+        LoginError::BadCredentials { .. } => "Couldn't unlock vault".to_string(),
+        // fixed texts too: no os error message and no path
+        LoginError::Storage(e) => e.to_string(),
+    }
 }
 
 // what to tell the user about the log check at login; None when there is nothing to say
-#[allow(dead_code)] // task 11
 pub(crate) fn message_for_log_check(check: &LogCheck) -> Option<String> {
-    let _ = check;
-    todo!("task 11")
+    match check {
+        LogCheck::Tampered(_) => {
+            Some("Warning: the activity log was changed outside the app".to_string())
+        }
+        LogCheck::Clean {
+            failed_attempts_since_last_session: 0,
+        } => None,
+        LogCheck::Clean {
+            failed_attempts_since_last_session: n,
+        } => Some(format!(
+            "{n} failed unlock attempts for this user since your last session"
+        )),
+    }
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 pub fn run() -> ExitCode {
+    hardening::install_panic_hook();
+    hardening::disable_core_dumps();
+
     let data = match DataDir::resolve() {
-        Ok(data) => data,
-        Err(e) => {
-            eprintln!("{e}");
+        Ok(data) if data.ensure().is_ok() => data,
+        _ => {
+            eprintln!("{STORAGE_UNAVAILABLE}");
             return ExitCode::FAILURE;
         }
     };
-    let Ok(user) = Username::parse(BRIDGE_USER) else {
-        return ExitCode::FAILURE;
-    };
+    let log = Logger::open(&data, now);
+    if !log.is_available() {
+        eprintln!("Logging unavailable");
+    }
+    log.log(None, Event::AppStart);
 
-    // try_exists, not exists: a permission error must not look like "no vault yet"
-    let session = match data.user_file(&user, UserFile::Vault).try_exists() {
-        Ok(false) => match create_vault(&data, &user) {
-            Ok(Some(session)) => session,
-            Ok(None) => return ExitCode::SUCCESS,
-            Err(()) => return ExitCode::FAILURE,
-        },
-        Ok(true) => match unlock_vault(&data, &user) {
-            Ok(Some(session)) => session,
-            Ok(None) => return ExitCode::SUCCESS,
-            Err(()) => return ExitCode::FAILURE,
-        },
-        Err(_) => {
-            eprintln!("{}", StorageError::Io(io::ErrorKind::Other.into()));
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // None when there is no usable clipboard, copy then reports it instead of printing the password
+    // None when there is no usable clipboard; copy then reports it instead of printing the password
     let clipboard = clipboard::system().ok();
-    let exit = |code: ExitCode| {
-        if let Some(clipboard) = &clipboard {
-            clipboard.clear_if_unchanged();
-        }
-        code
-    };
+    if let Some(clipboard) = &clipboard {
+        // best-effort: without it, closing the terminal leaves the 20 s timer as the only clear
+        let _ = hardening::clear_clipboard_on_signals(clipboard);
+    }
 
+    let code = startup(&data, &log, clipboard.as_ref());
+
+    if let Some(clipboard) = &clipboard {
+        clipboard.clear_if_unchanged();
+    }
+    log.log(None, Event::AppExit { code });
+    ExitCode::from(code)
+}
+
+// where a startup flow leads
+enum Step {
+    Back,
+    Exit(u8),
+    LoggedIn(LoggedIn),
+}
+
+fn startup(data: &DataDir, log: &Logger, clipboard: Option<&SystemClipboard>) -> u8 {
     loop {
-        let mut vault = match storage::load(&session) {
-            Ok(vault) => vault,
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                return exit(ExitCode::FAILURE);
+        let choice = match Select::new("SecureVault", STARTUP.to_vec()).prompt() {
+            Ok(choice) => choice,
+            Err(e) => return exit_code_of(&e),
+        };
+        let step = match choice {
+            StartupAction::LogIn => log_in(data, log),
+            StartupAction::CreateUser => create_user(data, log),
+            StartupAction::Exit => return 0,
+        };
+        match step {
+            Step::Back => {}
+            Step::Exit(code) => return code,
+            Step::LoggedIn(logged_in) => {
+                if let Some(message) = message_for_log_check(&logged_in.check) {
+                    println!("{message}");
+                }
+                let code = main_menu(&logged_in.session, log, clipboard);
+                // every way out of the menu ends the session properly
+                actions::logout(log, logged_in);
+                return code;
             }
-        };
-
-        let Ok(action) = Select::new("What would you like to do?", MENU.to_vec()).prompt() else {
-            return exit(ExitCode::SUCCESS);
-        };
-
-        let result = match action {
-            MenuAction::Add => add(&mut vault, &session),
-            MenuAction::List => {
-                list(&vault);
-                Ok(())
-            }
-            MenuAction::Copy => copy(&vault, clipboard.as_ref()),
-            MenuAction::Delete => delete(&mut vault, &session),
-            MenuAction::Exit => return exit(ExitCode::SUCCESS),
-        };
-
-        match result {
-            Ok(()) => {}
-            Err(ActionError::Cancelled) => println!("Cancelled."),
-            Err(e) => eprintln!("Error: {}", e),
         }
     }
 }
 
-// Ok(None) means the user cancelled, Err(()) means creating failed and the app exits with failure
-fn create_vault(data: &DataDir, user: &Username) -> Result<Option<Session>, ()> {
-    println!("No vault found — create one.");
-    let password = Password::new("New master password:")
+fn prompt_username() -> Result<Option<Username>, InquireError> {
+    let name = match Text::new("Username:").prompt() {
+        Ok(name) => name,
+        Err(InquireError::OperationCanceled) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match Username::parse(&name) {
+        Ok(user) => Ok(Some(user)),
+        Err(_) => {
+            // counts as nothing: no lookup, no log entry, no hint about who exists
+            eprintln!("Invalid username");
+            Ok(None)
+        }
+    }
+}
+
+fn log_in(data: &DataDir, log: &Logger) -> Step {
+    let user = match prompt_username() {
+        Ok(Some(user)) => user,
+        Ok(None) => return Step::Back,
+        Err(e) => return Step::Exit(exit_code_of(&e)),
+    };
+    if let LockState::Locked { remaining_secs } = actions::lock_state(data, log, &user, now()) {
+        eprintln!(
+            "{}",
+            message_for_login(&LoginError::Locked { remaining_secs })
+        );
+        return Step::Back;
+    }
+
+    for _ in 0..UNLOCK_ATTEMPTS {
+        let password = match Password::new("Master password:")
+            .with_display_mode(PasswordDisplayMode::Masked)
+            .without_confirmation()
+            .prompt()
+        {
+            Ok(password) => Zeroizing::new(password),
+            Err(InquireError::OperationCanceled) => return Step::Back,
+            Err(e) => return Step::Exit(exit_code_of(&e)),
+        };
+        match actions::login(data, log, &user, &password, now()) {
+            Ok(logged_in) => return Step::LoggedIn(logged_in),
+            Err(e @ LoginError::BadCredentials { .. }) => eprintln!("{}", message_for_login(&e)),
+            Err(e @ LoginError::Locked { .. }) => {
+                eprintln!("{}", message_for_login(&e));
+                return Step::Back;
+            }
+            // access denied, already open, storage errors: not something another try fixes
+            Err(e) => {
+                eprintln!("{}", message_for_login(&e));
+                return Step::Exit(1);
+            }
+        }
+    }
+    Step::Exit(1)
+}
+
+fn create_user(data: &DataDir, log: &Logger) -> Step {
+    let name = match Text::new("Username:")
+        .with_validator(|input: &str| {
+            Ok(match Username::parse(input) {
+                Ok(_) => Validation::Valid,
+                Err(_) => Validation::Invalid(USERNAME_RULES.into()),
+            })
+        })
+        .prompt()
+    {
+        Ok(name) => name,
+        Err(InquireError::OperationCanceled) => return Step::Back,
+        Err(e) => return Step::Exit(exit_code_of(&e)),
+    };
+    let Ok(user) = Username::parse(&name) else {
+        return Step::Back;
+    };
+    // asked before the password, so nobody types one for a name that can't be used
+    if data.user_file(&user, UserFile::Vault).exists() {
+        eprintln!("{}", StorageError::UserExists);
+        return Step::Back;
+    }
+
+    let password = match Password::new("New master password:")
         .with_display_mode(PasswordDisplayMode::Masked)
         .with_custom_confirmation_message("Confirm master password:")
         .with_custom_confirmation_error_message("Passwords do not match")
@@ -241,130 +317,181 @@ fn create_vault(data: &DataDir, user: &Username) -> Result<Option<Session>, ()> 
             })
         })
         .prompt()
-        .ok()
-        .map(Zeroizing::new);
-    let Some(password) = password else {
-        return Ok(None);
+    {
+        Ok(password) => Zeroizing::new(password),
+        Err(InquireError::OperationCanceled) => return Step::Back,
+        Err(e) => return Step::Exit(exit_code_of(&e)),
     };
 
-    match storage::create_user(data, user, &password) {
-        Ok(session) => Ok(Some(session)),
+    match actions::create_user(data, log, &user, &password) {
+        Ok(logged_in) => Step::LoggedIn(logged_in),
+        Err(e @ StorageError::UserExists) => {
+            eprintln!("{e}");
+            Step::Back
+        }
         Err(e) => {
-            eprintln!("Error: {}", e);
-            Err(())
+            eprintln!("{e}");
+            Step::Exit(1)
         }
     }
 }
 
-// Ok(None) means the user cancelled, Err(()) means give up and exit with failure
-fn unlock_vault(data: &DataDir, user: &Username) -> Result<Option<Session>, ()> {
-    for _ in 0..UNLOCK_ATTEMPTS {
-        let Ok(password) = Password::new("Master password:")
-            .with_display_mode(PasswordDisplayMode::Masked)
-            .without_confirmation()
-            .prompt()
-            .map(Zeroizing::new)
-        else {
-            return Ok(None);
+// a failed action: back to the menu, or out of the app
+enum ActionError {
+    Cancelled,
+    Prompt(InquireError),
+    Op(OpError),
+}
+
+impl From<InquireError> for ActionError {
+    fn from(e: InquireError) -> Self {
+        match e {
+            InquireError::OperationCanceled => ActionError::Cancelled,
+            other => ActionError::Prompt(other),
+        }
+    }
+}
+
+impl From<OpError> for ActionError {
+    fn from(e: OpError) -> Self {
+        ActionError::Op(e)
+    }
+}
+
+// the menu comes first and each action loads what it needs, so nothing decrypted waits here
+fn main_menu(session: &Session, log: &Logger, clipboard: Option<&SystemClipboard>) -> u8 {
+    loop {
+        let action = match Select::new("What would you like to do?", MENU.to_vec()).prompt() {
+            Ok(action) => action,
+            Err(e) => return exit_code_of(&e),
         };
-
-        match storage::unlock(data, user, &password) {
-            Ok(session) => return Ok(Some(session)),
-            Err(e @ (StorageError::Unlock | StorageError::NotFound)) => eprintln!("{e}"),
-            Err(e) => {
-                eprintln!("{}", e);
-                return Err(());
+        let result = match action {
+            MenuAction::Add => add(session, log),
+            MenuAction::List => list(session, log),
+            MenuAction::Copy => copy(session, log, clipboard),
+            MenuAction::Update => update(session, log),
+            MenuAction::Delete => delete(session, log),
+            MenuAction::Exit => return 0,
+        };
+        match result {
+            Ok(()) => {}
+            Err(ActionError::Cancelled) => println!("Cancelled."),
+            Err(ActionError::Prompt(e)) => return exit_code_of(&e),
+            // the vault can't be read or written safely any more: stop rather than retry
+            Err(ActionError::Op(e @ OpError::Storage(_))) => {
+                eprintln!("Error: {e}");
+                return 1;
             }
+            Err(ActionError::Op(e)) => eprintln!("Error: {e}"),
         }
     }
-    Err(())
 }
 
-fn add(vault: &mut Vault, session: &Session) -> Result<(), ActionError> {
-    let service = Text::new("Service:")
-        .with_validator(required!("Service is required"))
-        .prompt()?;
-    if vault.get(&service).is_some() {
-        return Err(VaultError::DuplicateService.into());
-    }
+fn add(session: &Session, log: &Logger) -> Result<(), ActionError> {
+    let typed = Text::new("Service:").prompt()?;
+    let service = actions::check_new_service(session, log, &typed)?;
     let username = Text::new("Username:").prompt()?;
     let password = Password::new("Password:")
         .with_display_mode(PasswordDisplayMode::Masked)
         .with_custom_confirmation_message("Confirm password:")
         .with_custom_confirmation_error_message("Passwords do not match")
-        .prompt()?;
+        .prompt()
+        .map(Zeroizing::new)?;
 
-    vault.add(Credential {
-        service,
-        username,
-        password,
-    })?;
-    storage::save(session, vault)?;
+    actions::add(session, log, &service, &username, password)?;
     println!("Saved.");
     Ok(())
 }
 
-fn list(vault: &Vault) {
-    if vault.is_empty() {
-        println!("Vault is empty.");
-        return;
+fn list(session: &Session, log: &Logger) -> Result<(), ActionError> {
+    let listed = actions::list(session, log)?;
+    if listed.is_empty() {
+        println!("No credentials saved.");
     }
-    vault
-        .credentials()
-        .iter()
-        .for_each(|c| println!("{} — {}", c.service, c.username));
-}
-
-// never falls back to printing, a password must not end up in the terminal or its scrollback
-fn copy(
-    vault: &Vault,
-    clipboard: Option<&ClipboardManager<arboard::Clipboard>>,
-) -> Result<(), ActionError> {
-    let Some(service) = select_service(vault)? else {
-        return Ok(());
-    };
-    let credential = vault.get(&service).ok_or(VaultError::NotFound)?;
-
-    match clipboard.map(|clipboard| clipboard.copy(&credential.password)) {
-        Some(Ok(())) => println!(
-            "Copied password for '{}' — clipboard clears in {}s.",
-            service,
-            CLEAR_AFTER.as_secs()
-        ),
-        _ => eprintln!("Clipboard unavailable"),
+    for entry in listed {
+        println!("{} — {}", entry.service, entry.username);
     }
     Ok(())
 }
 
-fn delete(vault: &mut Vault, session: &Session) -> Result<(), ActionError> {
-    let Some(service) = select_service(vault)? else {
+// never falls back to printing: a password must not end up in the terminal or its scrollback
+fn copy(
+    session: &Session,
+    log: &Logger,
+    clipboard: Option<&SystemClipboard>,
+) -> Result<(), ActionError> {
+    let Some(service) = select_service(session, log)? else {
         return Ok(());
     };
-    let confirmed = Confirm::new(&format!("Delete '{}'?", service))
+    actions::copy_password(session, log, clipboard, &service)?;
+    println!(
+        "Copied password for '{service}' — clipboard clears in {}s.",
+        CLEAR_AFTER.as_secs()
+    );
+    Ok(())
+}
+
+fn update(session: &Session, log: &Logger) -> Result<(), ActionError> {
+    let Some(service) = select_service(session, log)? else {
+        return Ok(());
+    };
+    let field = Select::new(
+        "Change:",
+        vec![UpdateField::Username, UpdateField::Password],
+    )
+    .prompt()?;
+    match field {
+        UpdateField::Username => {
+            let new = Text::new("New username:").prompt()?;
+            actions::update_username(session, log, &service, &new)?;
+        }
+        UpdateField::Password => {
+            let new = Password::new("New password:")
+                .with_display_mode(PasswordDisplayMode::Masked)
+                .with_custom_confirmation_message("Confirm password:")
+                .with_custom_confirmation_error_message("Passwords do not match")
+                .prompt()
+                .map(Zeroizing::new)?;
+            actions::update_password(session, log, &service, new)?;
+        }
+    }
+    println!("Updated.");
+    Ok(())
+}
+
+fn delete(session: &Session, log: &Logger) -> Result<(), ActionError> {
+    let Some(service) = select_service(session, log)? else {
+        return Ok(());
+    };
+    let confirmed = Confirm::new(&format!("Delete '{service}'?"))
         .with_default(false)
         .prompt()?;
     if !confirmed {
         return Err(ActionError::Cancelled);
     }
-
-    vault.remove(&service)?;
-    storage::save(session, vault)?;
+    actions::delete(session, log, &service)?;
     println!("Deleted.");
     Ok(())
 }
 
-fn select_service(vault: &Vault) -> Result<Option<String>, ActionError> {
-    if vault.is_empty() {
-        println!("Vault is empty.");
+// showing the names is a listing, so it is logged as one
+fn select_service(session: &Session, log: &Logger) -> Result<Option<String>, ActionError> {
+    let services: Vec<String> = actions::list(session, log)?
+        .into_iter()
+        .map(|entry| entry.service)
+        .collect();
+    if services.is_empty() {
+        println!("No credentials saved.");
         return Ok(None);
     }
-    let service = Select::new("Service:", vault.services()).prompt()?;
-    Ok(Some(service.to_string()))
+    Ok(Some(Select::new("Service:", services).prompt()?))
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::audit::TamperProblem;
+    use std::io;
     use crate::vault::lockout::Failure;
 
     // the spec's two menus, in order. there is no entry that shows a password: copy only
