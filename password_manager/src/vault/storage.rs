@@ -327,7 +327,6 @@ pub fn check_new_user(dir: &DataDir, user: &Username) -> Result<(), StorageError
     access::check_dir(&user_dir)?;
     let vault = dir.user_file(user, UserFile::Vault);
     if !entry_exists(&vault)? {
-        // a half-created user: create reuses the folder
         return Ok(());
     }
     access::check_file(&vault)?;
