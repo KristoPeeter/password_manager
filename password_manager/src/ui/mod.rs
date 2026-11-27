@@ -2,6 +2,7 @@ pub(crate) mod clipboard;
 
 use std::{
     fmt,
+    io::{self, IsTerminal, Write},
     process::ExitCode,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -13,7 +14,7 @@ use zeroize::Zeroizing;
 
 use clipboard::{CLEAR_AFTER, ClipboardManager};
 
-use crate::actions::{self, LoggedIn, OpError};
+use crate::actions::{self, Listed, LoggedIn, OpError};
 use crate::audit::{Event, LogCheck, Logger};
 use crate::hardening;
 use crate::paths::{DataDir, PathsError, Username};
@@ -28,6 +29,7 @@ use crate::vault::validation;
 
 const UNLOCK_ATTEMPTS: usize = 3;
 const STORAGE_UNAVAILABLE: &str = "Could not access vault storage";
+const NO_CREDENTIALS: &str = "No credentials saved.";
 const USERNAME_RULES: &str =
     "1–32 characters: a–z, 0–9, - and _, starting with a letter or a digit";
 
@@ -237,10 +239,8 @@ fn startup(data: &DataDir, log: &Logger, clipboard: Option<&SystemClipboard>) ->
             Step::Back => {}
             Step::Exit(code) => return code,
             Step::LoggedIn(logged_in) => {
-                if let Some(message) = message_for_log_check(&logged_in.check) {
-                    println!("{message}");
-                }
-                let code = main_menu(&logged_in.session, log, clipboard);
+                let first = status_after_login(&logged_in.check);
+                let code = main_menu(&logged_in.session, log, clipboard, first);
                 // every way out of the menu ends the session properly
                 actions::logout(log, logged_in);
                 return code;
@@ -367,6 +367,7 @@ fn create_user(data: &DataDir, log: &Logger) -> Step {
 }
 
 // a failed action: back to the menu, or out of the app
+#[derive(Debug)]
 enum ActionError {
     Cancelled,
     Prompt(InquireError),
@@ -388,9 +389,103 @@ impl From<OpError> for ActionError {
     }
 }
 
+// the one line left above the menu after the screen is cleared: what the last action did, or what went wrong
+#[derive(Debug, PartialEq)]
+pub(crate) enum Status {
+    Info(String),
+    // printed to stderr
+    Error(String),
+}
+
+// what the menu loop does after an action
+#[derive(Debug, PartialEq)]
+pub(crate) enum MenuStep {
+    Show(Option<Status>),
+    // the status is printed before leaving, so the reason stays visible
+    Exit { code: u8, status: Option<Status> },
+}
+
+// clears what is visible and moves the cursor home. not the scrollback: that is the user's own terminal history from before the app
+pub(crate) fn clear_screen_code() -> &'static str {
+    "\x1b[2J\x1b[H"
+}
+
+// an action returns the line to show (Saved., Deleted., ...) or None when it showed its own screen, like list
+fn menu_step(result: Result<Option<String>, ActionError>) -> MenuStep {
+    match result {
+        Ok(message) => MenuStep::Show(message.map(Status::Info)),
+        Err(ActionError::Cancelled) => MenuStep::Show(Some(Status::Info("Cancelled.".into()))),
+        Err(ActionError::Prompt(e)) => MenuStep::Exit {
+            code: exit_code_of(&e),
+            status: None,
+        },
+        // the vault can't be read or written safely any more: stop rather than retry
+        Err(ActionError::Op(e @ OpError::Storage(_))) => MenuStep::Exit {
+            code: 1,
+            status: Some(Status::Error(format!("Error: {e}"))),
+        },
+        Err(ActionError::Op(e)) => MenuStep::Show(Some(Status::Error(format!("Error: {e}")))),
+    }
+}
+
+// the log check's message becomes the first status line, so clearing the screen doesn't hide it
+pub(crate) fn status_after_login(check: &LogCheck) -> Option<Status> {
+    let message = message_for_log_check(check)?;
+    Some(match check {
+        LogCheck::Tampered(_) => Status::Error(message),
+        LogCheck::Clean { .. } => Status::Info(message),
+    })
+}
+
+// what list shows before it waits
+pub(crate) fn list_lines(entries: &[Listed]) -> Vec<String> {
+    if entries.is_empty() {
+        return vec![NO_CREDENTIALS.to_string()];
+    }
+    entries
+        .iter()
+        .map(|entry| format!("{} — {}", entry.service, entry.username))
+        .collect()
+}
+
+// the pause after list: Enter or Esc both just go back, Ctrl-C and terminal errors still end the app
+fn after_pause(result: Result<(), InquireError>) -> Result<(), ActionError> {
+    match result {
+        Ok(()) | Err(InquireError::OperationCanceled) => Ok(()),
+        Err(e) => Err(ActionError::Prompt(e)),
+    }
+}
+
+fn show(status: &Status) {
+    match status {
+        Status::Info(text) => println!("{text}"),
+        Status::Error(text) => eprintln!("{text}"),
+    }
+}
+
+// only on a terminal: piped output would just get the escape codes
+fn clear_screen() {
+    let mut out = io::stdout();
+    if out.is_terminal() {
+        let _ = write!(out, "{}", clear_screen_code());
+        let _ = out.flush();
+    }
+}
+
 // the menu comes first and each action loads what it needs, so nothing decrypted waits here
-fn main_menu(session: &Session, log: &Logger, clipboard: Option<&SystemClipboard>) -> u8 {
+fn main_menu(
+    session: &Session,
+    log: &Logger,
+    clipboard: Option<&SystemClipboard>,
+    first: Option<Status>,
+) -> u8 {
+    let mut status = first;
     loop {
+        // a clean screen each time: only the menu and what the last action did
+        clear_screen();
+        if let Some(status) = &status {
+            show(status);
+        }
         let action = match Select::new("What would you like to do?", MENU.to_vec()).prompt() {
             Ok(action) => action,
             Err(e) => return exit_code_of(&e),
@@ -403,21 +498,21 @@ fn main_menu(session: &Session, log: &Logger, clipboard: Option<&SystemClipboard
             MenuAction::Delete => delete(session, log),
             MenuAction::Exit => return 0,
         };
-        match result {
-            Ok(()) => {}
-            Err(ActionError::Cancelled) => println!("Cancelled."),
-            Err(ActionError::Prompt(e)) => return exit_code_of(&e),
-            // the vault can't be read or written safely any more: stop rather than retry
-            Err(ActionError::Op(e @ OpError::Storage(_))) => {
-                eprintln!("Error: {e}");
-                return 1;
+        match menu_step(result) {
+            MenuStep::Show(next) => status = next,
+            MenuStep::Exit { code, status } => {
+                if let Some(status) = &status {
+                    show(status);
+                }
+                return code;
             }
-            Err(ActionError::Op(e)) => eprintln!("Error: {e}"),
         }
     }
 }
 
-fn add(session: &Session, log: &Logger) -> Result<(), ActionError> {
+// each action returns the line to show above the next menu, or None when it had its own screen
+
+fn add(session: &Session, log: &Logger) -> Result<Option<String>, ActionError> {
     let typed = Text::new("Service:").prompt()?;
     let service = actions::check_new_service(session, log, &typed)?;
     let username = Text::new("Username:").prompt()?;
@@ -429,19 +524,21 @@ fn add(session: &Session, log: &Logger) -> Result<(), ActionError> {
         .map(Zeroizing::new)?;
 
     actions::add(session, log, &service, &username, password)?;
-    println!("Saved.");
-    Ok(())
+    Ok(Some("Saved.".into()))
 }
 
-fn list(session: &Session, log: &Logger) -> Result<(), ActionError> {
+// the list stays on screen until the user is done reading it
+fn list(session: &Session, log: &Logger) -> Result<Option<String>, ActionError> {
     let listed = actions::list(session, log)?;
-    if listed.is_empty() {
-        println!("No credentials saved.");
+    for line in list_lines(&listed) {
+        println!("{line}");
     }
-    for entry in listed {
-        println!("{} — {}", entry.service, entry.username);
-    }
-    Ok(())
+    let pause = Select::new("Press Enter to go back", vec!["Back"])
+        .without_help_message()
+        .prompt()
+        .map(|_| ());
+    after_pause(pause)?;
+    Ok(None)
 }
 
 // never falls back to printing: a password must not end up in the terminal or its scrollback
@@ -449,21 +546,20 @@ fn copy(
     session: &Session,
     log: &Logger,
     clipboard: Option<&SystemClipboard>,
-) -> Result<(), ActionError> {
+) -> Result<Option<String>, ActionError> {
     let Some(service) = select_service(session, log)? else {
-        return Ok(());
+        return Ok(Some(NO_CREDENTIALS.into()));
     };
     actions::copy_password(session, log, clipboard, &service)?;
-    println!(
+    Ok(Some(format!(
         "Copied password for '{service}' — clipboard clears in {}s.",
         CLEAR_AFTER.as_secs()
-    );
-    Ok(())
+    )))
 }
 
-fn update(session: &Session, log: &Logger) -> Result<(), ActionError> {
+fn update(session: &Session, log: &Logger) -> Result<Option<String>, ActionError> {
     let Some(service) = select_service(session, log)? else {
-        return Ok(());
+        return Ok(Some(NO_CREDENTIALS.into()));
     };
     let field = Select::new(
         "Change:",
@@ -485,13 +581,12 @@ fn update(session: &Session, log: &Logger) -> Result<(), ActionError> {
             actions::update_password(session, log, &service, new)?;
         }
     }
-    println!("Updated.");
-    Ok(())
+    Ok(Some("Updated.".into()))
 }
 
-fn delete(session: &Session, log: &Logger) -> Result<(), ActionError> {
+fn delete(session: &Session, log: &Logger) -> Result<Option<String>, ActionError> {
     let Some(service) = select_service(session, log)? else {
-        return Ok(());
+        return Ok(Some(NO_CREDENTIALS.into()));
     };
     let confirmed = Confirm::new(&format!("Delete '{service}'?"))
         .with_default(false)
@@ -500,18 +595,16 @@ fn delete(session: &Session, log: &Logger) -> Result<(), ActionError> {
         return Err(ActionError::Cancelled);
     }
     actions::delete(session, log, &service)?;
-    println!("Deleted.");
-    Ok(())
+    Ok(Some("Deleted.".into()))
 }
 
-// showing the names is a listing, so it is logged as one
+// showing the names is a listing, so it is logged as one. None when there is nothing to pick
 fn select_service(session: &Session, log: &Logger) -> Result<Option<String>, ActionError> {
     let services: Vec<String> = actions::list(session, log)?
         .into_iter()
         .map(|entry| entry.service)
         .collect();
     if services.is_empty() {
-        println!("No credentials saved.");
         return Ok(None);
     }
     Ok(Some(Select::new("Service:", services).prompt()?))
@@ -522,7 +615,6 @@ mod tests {
     use super::*;
     use crate::audit::TamperProblem;
     use crate::vault::lockout::Failure;
-    use std::io;
 
     // the spec's two menus, in order. there is no entry that shows a password: copy only
     #[test]
@@ -696,5 +788,121 @@ mod tests {
         for call in [".exists()", ".try_exists()", "fs::"] {
             assert!(!code.contains(call), "ui calls {call}");
         }
+    }
+
+    fn info(text: &str) -> Option<Status> {
+        Some(Status::Info(text.to_string()))
+    }
+
+    fn error(text: &str) -> Option<Status> {
+        Some(Status::Error(text.to_string()))
+    }
+
+    // the visible screen is cleared and the cursor goes home; the scrollback (ESC[3J) is left alone
+    #[test]
+    fn clearing_keeps_the_scrollback() {
+        assert_eq!(clear_screen_code(), "\x1b[2J\x1b[H");
+    }
+
+    // after each action the menu comes back on a clean screen with one line saying what happened
+    #[test]
+    fn each_outcome_leaves_one_status_line() {
+        assert_eq!(
+            menu_step(Ok(Some("Saved.".to_string()))),
+            MenuStep::Show(info("Saved."))
+        );
+        // list showed its own screen and waited, so nothing is left to say
+        assert_eq!(menu_step(Ok(None)), MenuStep::Show(None));
+        assert_eq!(
+            menu_step(Err(ActionError::Cancelled)),
+            MenuStep::Show(info("Cancelled."))
+        );
+        assert_eq!(
+            menu_step(Err(ActionError::Op(OpError::Vault(
+                crate::vault::models::VaultError::DuplicateService
+            )))),
+            MenuStep::Show(error("Error: Credential already exists"))
+        );
+        assert_eq!(
+            menu_step(Err(ActionError::Op(OpError::ClipboardUnavailable))),
+            MenuStep::Show(error("Error: Clipboard unavailable"))
+        );
+    }
+
+    // a storage failure still ends the session, and says why before it does; leaving a prompt keeps its exit code
+    #[test]
+    fn failures_that_end_the_session_keep_their_message() {
+        assert_eq!(
+            menu_step(Err(ActionError::Op(OpError::Storage(StorageError::Io(
+                io::Error::new(io::ErrorKind::PermissionDenied, "/home/alice: os error 13")
+            ))))),
+            MenuStep::Exit {
+                code: 1,
+                status: error("Error: Could not access vault storage"),
+            }
+        );
+        assert_eq!(
+            menu_step(Err(ActionError::Prompt(InquireError::OperationInterrupted))),
+            MenuStep::Exit {
+                code: 0,
+                status: None
+            }
+        );
+        assert_eq!(
+            menu_step(Err(ActionError::Prompt(InquireError::NotTTY))),
+            MenuStep::Exit {
+                code: 1,
+                status: None
+            }
+        );
+    }
+
+    // the log check's warning survives the first clear: it is the first status line
+    #[test]
+    fn log_check_is_the_first_status_line() {
+        let clean = |n| LogCheck::Clean {
+            failed_attempts_since_last_session: n,
+        };
+        assert_eq!(status_after_login(&clean(0)), None);
+        assert_eq!(
+            status_after_login(&clean(2)),
+            info("2 failed unlock attempts for this user since your last session")
+        );
+        assert_eq!(
+            status_after_login(&LogCheck::Tampered(TamperProblem::ChainBroken)),
+            error("Warning: the activity log was changed outside the app")
+        );
+    }
+
+    // one line per credential, and a plain sentence for an empty vault
+    #[test]
+    fn list_shows_service_and_username() {
+        let entries = [
+            Listed {
+                service: "github".to_string(),
+                username: "alice".to_string(),
+            },
+            Listed {
+                service: "mail".to_string(),
+                username: String::new(),
+            },
+        ];
+        assert_eq!(list_lines(&entries), ["github — alice", "mail — "]);
+        assert_eq!(list_lines(&[]), ["No credentials saved."]);
+    }
+
+    // Enter and Esc on the pause both just go back to the menu; Ctrl-C and a broken terminal don't
+    #[test]
+    fn pause_after_list_goes_back() {
+        assert!(after_pause(Ok(())).is_ok());
+        assert!(after_pause(Err(InquireError::OperationCanceled)).is_ok());
+        assert!(matches!(
+            after_pause(Err(InquireError::OperationInterrupted)),
+            Err(ActionError::Prompt(InquireError::OperationInterrupted))
+        ));
+        assert!(matches!(
+            after_pause(Err(InquireError::NotTTY)),
+            Err(ActionError::Prompt(InquireError::NotTTY))
+        ));
     }
 }
