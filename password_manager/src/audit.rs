@@ -1454,6 +1454,177 @@ mod tests {
         assert_eq!(check, LogCheck::Tampered(TamperProblem::ChainBroken));
     }
 
+    // lines before alice's sealed one are cut off, so the chain is broken for everyone from now on
+    fn cut_front(data: &DataDir) {
+        let mut kept = lines(&data.log_file());
+        kept.drain(..2);
+        write_lines(&data.log_file(), &kept);
+    }
+
+    // a broken chain stays broken, warning only once
+
+    #[test]
+    fn broken_chain_warning_is_given_once() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        let logger = Logger::open(&data, clock);
+        for _ in 0..3 {
+            logger.log(Some(&user("bob")), Event::CredentialsListed);
+        }
+        sealed_history(&data, &alice);
+        cut_front(&data);
+
+        let logger = Logger::open(&data, clock);
+        assert_eq!(
+            logger.begin_session(&alice, true),
+            LogCheck::Tampered(TamperProblem::ChainBroken)
+        );
+        logger.end_session();
+
+        let check = Logger::open(&data, clock).begin_session(&alice, true);
+
+        assert_eq!(check, clean(0));
+    }
+
+    // only the break alice was warned about is accepted: a new one after the warning is reported again
+    #[test]
+    fn new_break_after_the_warning_is_reported() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        let logger = Logger::open(&data, clock);
+        for _ in 0..3 {
+            logger.log(Some(&user("bob")), Event::CredentialsListed);
+        }
+        sealed_history(&data, &alice);
+        cut_front(&data);
+        let logger = Logger::open(&data, clock);
+        logger.begin_session(&alice, true);
+        for _ in 0..3 {
+            logger.log(Some(&user("alice")), Event::CredentialsListed);
+        }
+        logger.end_session();
+        let mut lines = lines(&data.log_file());
+        let second_last = lines.len() - 2;
+        lines.remove(second_last);
+        write_lines(&data.log_file(), &lines);
+
+        let check = Logger::open(&data, clock).begin_session(&alice, true);
+
+        assert!(matches!(check, LogCheck::Tampered(_)), "{check:?}");
+    }
+
+    // the warning is remembered per user: bob hasn't seen it yet, so he still gets it, once
+    #[test]
+    fn each_user_is_warned_once_about_a_break() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        let bob = session(&data, "bob");
+        let logger = Logger::open(&data, clock);
+        for _ in 0..3 {
+            logger.log(None, Event::AppStart);
+        }
+        logger.begin_session(&bob, false);
+        logger.log(Some(&user("bob")), Event::CredentialsListed);
+        logger.end_session();
+        sealed_history(&data, &alice);
+        let mut lines = lines(&data.log_file());
+        lines.remove(1);
+        write_lines(&data.log_file(), &lines);
+
+        for who in [&alice, &bob] {
+            let logger = Logger::open(&data, clock);
+            assert_eq!(
+                logger.begin_session(who, true),
+                LogCheck::Tampered(TamperProblem::ChainBroken),
+                "{}",
+                who.user().as_str()
+            );
+            logger.end_session();
+            let logger = Logger::open(&data, clock);
+            assert_eq!(
+                logger.begin_session(who, true),
+                clean(0),
+                "{}",
+                who.user().as_str()
+            );
+            logger.end_session();
+        }
+    }
+
+    // the warning line is where the accepted part ends; deleting it must not make the old break disappear
+    #[test]
+    fn deleting_the_warning_brings_the_warning_back() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        let logger = Logger::open(&data, clock);
+        for _ in 0..3 {
+            logger.log(Some(&user("bob")), Event::CredentialsListed);
+        }
+        sealed_history(&data, &alice);
+        cut_front(&data);
+        let logger = Logger::open(&data, clock);
+        logger.begin_session(&alice, true);
+        logger.log(Some(&user("alice")), Event::CredentialsListed);
+        logger.end_session();
+        let kept: Vec<String> = lines(&data.log_file())
+            .into_iter()
+            .filter(|l| !l.contains("log_tamper_detected"))
+            .collect();
+        write_lines(&data.log_file(), &kept);
+
+        let check = Logger::open(&data, clock).begin_session(&alice, true);
+
+        assert!(matches!(check, LogCheck::Tampered(_)), "{check:?}");
+    }
+
+    // once a break was accepted the seal says where trust starts again, and that is covered by the mac like everything else in it
+    #[test]
+    fn every_field_of_the_seal_is_authenticated() {
+        let (_dir, data) = data_dir();
+        let alice = session(&data, "alice");
+        let logger = Logger::open(&data, clock);
+        for _ in 0..3 {
+            logger.log(Some(&user("bob")), Event::CredentialsListed);
+        }
+        sealed_history(&data, &alice);
+        cut_front(&data);
+        let logger = Logger::open(&data, clock);
+        logger.begin_session(&alice, true);
+        logger.end_session();
+        let original = read_seal(&data, "alice");
+        let fields = original.as_object().unwrap();
+        assert!(
+            fields.len() > 3,
+            "the seal should also remember the accepted break: {original}"
+        );
+
+        for name in fields.keys().filter(|k| k.as_str() != "mac") {
+            let mut seal = original.clone();
+            seal[name] = match &seal[name] {
+                Value::Number(n) => (n.as_u64().unwrap() + 1).into(),
+                Value::String(s) => {
+                    let flipped = if s.starts_with('0') { "1" } else { "0" };
+                    format!("{flipped}{}", &s[1..]).into()
+                }
+                other => panic!("{name}: unexpected {other}"),
+            };
+            fs::write(
+                seal_path(&data, "alice"),
+                serde_json::to_vec(&seal).unwrap(),
+            )
+            .unwrap();
+            set_mode(&seal_path(&data, "alice"), 0o600);
+
+            let check = Logger::open(&data, clock).begin_session(&alice, true);
+
+            assert_eq!(
+                check,
+                LogCheck::Tampered(TamperProblem::SealMismatch),
+                "{name}"
+            );
+        }
+    }
+
     // logging is best-effort: another process holding the append lock must not hang the app. after a short wait the line is dropped, and logging works again once the lock is free
     #[test]
     fn held_append_lock_does_not_hang() {

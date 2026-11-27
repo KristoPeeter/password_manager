@@ -303,7 +303,12 @@ fn log_in(data: &DataDir, log: &Logger) -> Step {
             }
         }
     }
-    Step::Exit(1)
+    out_of_attempts()
+}
+
+// the lockout already limits guessing, so ending the whole app after the last try adds nothing
+fn out_of_attempts() -> Step {
+    todo!()
 }
 
 fn create_user(data: &DataDir, log: &Logger) -> Step {
@@ -904,5 +909,11 @@ mod tests {
             after_pause(Err(InquireError::NotTTY)),
             Err(ActionError::Prompt(InquireError::NotTTY))
         ));
+    }
+
+    // three wrong passwords end the login, not the app: the next try is refused by the lockout anyway
+    #[test]
+    fn three_wrong_passwords_go_back_to_the_start_menu() {
+        assert!(matches!(out_of_attempts(), Step::Back));
     }
 }
