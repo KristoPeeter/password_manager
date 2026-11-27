@@ -308,7 +308,7 @@ fn log_in(data: &DataDir, log: &Logger) -> Step {
 
 // the lockout already limits guessing, so ending the whole app after the last try adds nothing
 fn out_of_attempts() -> Step {
-    todo!()
+    Step::Back
 }
 
 fn create_user(data: &DataDir, log: &Logger) -> Step {
